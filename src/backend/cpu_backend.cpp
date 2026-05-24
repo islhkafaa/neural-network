@@ -17,9 +17,9 @@ constexpr int CblasRowMajor = 101;
 constexpr int CblasNoTrans = 111;
 constexpr int CblasTrans = 112;
 
-CpuBuffer::CpuBuffer(size_t bytes) : data_(bytes / sizeof(float), 0.0f) {}
+CpuBuffer::CpuBuffer(size_t bytes) : data_(bytes, 0) {}
 
-size_t CpuBuffer::size() const noexcept { return data_.size() * sizeof(float); }
+size_t CpuBuffer::size() const noexcept { return data_.size(); }
 
 void *CpuBuffer::data() noexcept { return data_.data(); }
 
@@ -47,8 +47,24 @@ void CpuBackend::copy_device_to_host(const DeviceBuffer &device_buf,
 }
 
 void CpuBackend::fill(DeviceBuffer &buffer, float value) {
-  auto &vec = static_cast<CpuBuffer &>(buffer).vec();
-  std::fill(vec.begin(), vec.end(), value);
+  if (value == 0.0f) {
+    std::memset(buffer.data(), 0, buffer.size());
+    return;
+  }
+  DataType dt = buffer.dtype();
+  size_t elements = buffer.size() / dtype_size(dt);
+  if (dt == DataType::FP32) {
+    float *ptr = static_cast<float *>(buffer.data());
+    std::fill(ptr, ptr + elements, value);
+  } else if (dt == DataType::FP16) {
+    uint16_t *ptr = static_cast<uint16_t *>(buffer.data());
+    uint16_t half_val = float_to_fp16(value);
+    std::fill(ptr, ptr + elements, half_val);
+  } else {
+    uint16_t *ptr = static_cast<uint16_t *>(buffer.data());
+    uint16_t half_val = float_to_bfloat16(value);
+    std::fill(ptr, ptr + elements, half_val);
+  }
 }
 
 static size_t get_input_offset(size_t flat_out_idx, const Shape &out_shape,
@@ -74,6 +90,26 @@ static size_t get_input_offset(size_t flat_out_idx, const Shape &out_shape,
   return in_offset;
 }
 
+static float read_value(const void *data, size_t index, DataType dtype) noexcept {
+  if (dtype == DataType::FP32) {
+    return static_cast<const float *>(data)[index];
+  } else if (dtype == DataType::FP16) {
+    return fp16_to_float(static_cast<const uint16_t *>(data)[index]);
+  } else {
+    return bfloat16_to_float(static_cast<const uint16_t *>(data)[index]);
+  }
+}
+
+static void write_value(void *data, size_t index, float val, DataType dtype) noexcept {
+  if (dtype == DataType::FP32) {
+    static_cast<float *>(data)[index] = val;
+  } else if (dtype == DataType::FP16) {
+    static_cast<uint16_t *>(data)[index] = float_to_fp16(val);
+  } else {
+    static_cast<uint16_t *>(data)[index] = float_to_bfloat16(val);
+  }
+}
+
 template <typename Op>
 static void
 elementwise_op(const DeviceBuffer &a, size_t a_offset, const Shape &a_shape,
@@ -81,9 +117,13 @@ elementwise_op(const DeviceBuffer &a, size_t a_offset, const Shape &a_shape,
                const Shape &b_shape, const Strides &b_strides,
                DeviceBuffer &out, size_t out_offset, const Shape &out_shape,
                const Strides &out_strides, Op op) {
-  const float *a_data = static_cast<const float *>(a.data()) + a_offset;
-  const float *b_data = static_cast<const float *>(b.data()) + b_offset;
-  float *out_data = static_cast<float *>(out.data()) + out_offset;
+  const void *a_data = a.data();
+  const void *b_data = b.data();
+  void *out_data = out.data();
+
+  DataType a_dt = a.dtype();
+  DataType b_dt = b.dtype();
+  DataType out_dt = out.dtype();
 
   size_t out_elements = count_elements(out_shape);
 
@@ -92,12 +132,16 @@ elementwise_op(const DeviceBuffer &a, size_t a_offset, const Shape &a_shape,
     if (out_elements >= 2048) {
       ThreadPool::instance().parallel_for(0, out_elements, [&](size_t start, size_t end) {
         for (size_t i = start; i < end; ++i) {
-          out_data[i] = op(a_data[i], b_data[i]);
+          float val_a = read_value(a_data, a_offset + i, a_dt);
+          float val_b = read_value(b_data, b_offset + i, b_dt);
+          write_value(out_data, out_offset + i, op(val_a, val_b), out_dt);
         }
       });
     } else {
       for (size_t i = 0; i < out_elements; ++i) {
-        out_data[i] = op(a_data[i], b_data[i]);
+        float val_a = read_value(a_data, a_offset + i, a_dt);
+        float val_b = read_value(b_data, b_offset + i, b_dt);
+        write_value(out_data, out_offset + i, op(val_a, val_b), out_dt);
       }
     }
     return;
@@ -109,7 +153,9 @@ elementwise_op(const DeviceBuffer &a, size_t a_offset, const Shape &a_shape,
         size_t a_idx = get_input_offset(i, out_shape, a_shape, a_strides);
         size_t b_idx = get_input_offset(i, out_shape, b_shape, b_strides);
         size_t out_idx = get_input_offset(i, out_shape, out_shape, out_strides);
-        out_data[out_idx] = op(a_data[a_idx], b_data[b_idx]);
+        float val_a = read_value(a_data, a_offset + a_idx, a_dt);
+        float val_b = read_value(b_data, b_offset + b_idx, b_dt);
+        write_value(out_data, out_offset + out_idx, op(val_a, val_b), out_dt);
       }
     });
   } else {
@@ -117,7 +163,9 @@ elementwise_op(const DeviceBuffer &a, size_t a_offset, const Shape &a_shape,
       size_t a_idx = get_input_offset(i, out_shape, a_shape, a_strides);
       size_t b_idx = get_input_offset(i, out_shape, b_shape, b_strides);
       size_t out_idx = get_input_offset(i, out_shape, out_shape, out_strides);
-      out_data[out_idx] = op(a_data[a_idx], b_data[b_idx]);
+      float val_a = read_value(a_data, a_offset + a_idx, a_dt);
+      float val_b = read_value(b_data, b_offset + b_idx, b_dt);
+      write_value(out_data, out_offset + out_idx, op(val_a, val_b), out_dt);
     }
   }
 }
@@ -127,20 +175,24 @@ static void
 unary_op(const DeviceBuffer &in, size_t in_offset, const Shape &in_shape,
          const Strides &in_strides, DeviceBuffer &out, size_t out_offset,
          const Shape &out_shape, const Strides &out_strides, Op op) {
-  const float *in_data = static_cast<const float *>(in.data()) + in_offset;
-  float *out_data = static_cast<float *>(out.data()) + out_offset;
+  const void *in_data = in.data();
+  void *out_data = out.data();
+  DataType in_dt = in.dtype();
+  DataType out_dt = out.dtype();
   size_t out_elements = count_elements(out_shape);
 
   if (is_contiguous(in_shape, in_strides) && is_contiguous(out_shape, out_strides)) {
     if (out_elements >= 2048) {
       ThreadPool::instance().parallel_for(0, out_elements, [&](size_t start, size_t end) {
         for (size_t i = start; i < end; ++i) {
-          out_data[i] = op(in_data[i]);
+          float val_in = read_value(in_data, in_offset + i, in_dt);
+          write_value(out_data, out_offset + i, op(val_in), out_dt);
         }
       });
     } else {
       for (size_t i = 0; i < out_elements; ++i) {
-        out_data[i] = op(in_data[i]);
+        float val_in = read_value(in_data, in_offset + i, in_dt);
+        write_value(out_data, out_offset + i, op(val_in), out_dt);
       }
     }
     return;
@@ -151,14 +203,16 @@ unary_op(const DeviceBuffer &in, size_t in_offset, const Shape &in_shape,
       for (size_t i = start; i < end; ++i) {
         size_t in_idx = get_input_offset(i, out_shape, in_shape, in_strides);
         size_t out_idx = get_input_offset(i, out_shape, out_shape, out_strides);
-        out_data[out_idx] = op(in_data[in_idx]);
+        float val_in = read_value(in_data, in_offset + in_idx, in_dt);
+        write_value(out_data, out_offset + out_idx, op(val_in), out_dt);
       }
     });
   } else {
     for (size_t i = 0; i < out_elements; ++i) {
       size_t in_idx = get_input_offset(i, out_shape, in_shape, in_strides);
       size_t out_idx = get_input_offset(i, out_shape, out_shape, out_strides);
-      out_data[out_idx] = op(in_data[in_idx]);
+      float val_in = read_value(in_data, in_offset + in_idx, in_dt);
+      write_value(out_data, out_offset + out_idx, op(val_in), out_dt);
     }
   }
 }
@@ -171,9 +225,14 @@ binary_backward_op(const DeviceBuffer &in, size_t in_offset, const Shape &in_sha
                    const Strides &grad_out_strides, DeviceBuffer &grad_in,
                    size_t grad_in_offset, const Shape &grad_in_shape,
                    const Strides &grad_in_strides, Op op) {
-  const float *in_data = static_cast<const float *>(in.data()) + in_offset;
-  const float *go_data = static_cast<const float *>(grad_out.data()) + grad_out_offset;
-  float *gi_data = static_cast<float *>(grad_in.data()) + grad_in_offset;
+  const void *in_data = in.data();
+  const void *go_data = grad_out.data();
+  void *gi_data = grad_in.data();
+
+  DataType in_dt = in.dtype();
+  DataType go_dt = grad_out.dtype();
+  DataType gi_dt = grad_in.dtype();
+
   size_t in_elements = count_elements(in_shape);
 
   if (is_contiguous(in_shape, in_strides) &&
@@ -182,12 +241,16 @@ binary_backward_op(const DeviceBuffer &in, size_t in_offset, const Shape &in_sha
     if (in_elements >= 2048) {
       ThreadPool::instance().parallel_for(0, in_elements, [&](size_t start, size_t end) {
         for (size_t i = start; i < end; ++i) {
-          gi_data[i] = op(in_data[i], go_data[i]);
+          float val_in = read_value(in_data, in_offset + i, in_dt);
+          float val_go = read_value(go_data, grad_out_offset + i, go_dt);
+          write_value(gi_data, grad_in_offset + i, op(val_in, val_go), gi_dt);
         }
       });
     } else {
       for (size_t i = 0; i < in_elements; ++i) {
-        gi_data[i] = op(in_data[i], go_data[i]);
+        float val_in = read_value(in_data, in_offset + i, in_dt);
+        float val_go = read_value(go_data, grad_out_offset + i, go_dt);
+        write_value(gi_data, grad_in_offset + i, op(val_in, val_go), gi_dt);
       }
     }
     return;
@@ -199,7 +262,9 @@ binary_backward_op(const DeviceBuffer &in, size_t in_offset, const Shape &in_sha
         size_t in_idx = get_input_offset(i, in_shape, in_shape, in_strides);
         size_t go_idx = get_input_offset(i, in_shape, grad_out_shape, grad_out_strides);
         size_t gi_idx = get_input_offset(i, in_shape, grad_in_shape, grad_in_strides);
-        gi_data[gi_idx] = op(in_data[in_idx], go_data[go_idx]);
+        float val_in = read_value(in_data, in_offset + in_idx, in_dt);
+        float val_go = read_value(go_data, grad_out_offset + go_idx, go_dt);
+        write_value(gi_data, grad_in_offset + gi_idx, op(val_in, val_go), gi_dt);
       }
     });
   } else {
@@ -207,7 +272,9 @@ binary_backward_op(const DeviceBuffer &in, size_t in_offset, const Shape &in_sha
       size_t in_idx = get_input_offset(i, in_shape, in_shape, in_strides);
       size_t go_idx = get_input_offset(i, in_shape, grad_out_shape, grad_out_strides);
       size_t gi_idx = get_input_offset(i, in_shape, grad_in_shape, grad_in_strides);
-      gi_data[gi_idx] = op(in_data[in_idx], go_data[go_idx]);
+      float val_in = read_value(in_data, in_offset + in_idx, in_dt);
+      float val_go = read_value(go_data, grad_out_offset + go_idx, go_dt);
+      write_value(gi_data, grad_in_offset + gi_idx, op(val_in, val_go), gi_dt);
     }
   }
 }
@@ -274,39 +341,47 @@ void CpuBackend::matmul(const DeviceBuffer &a, size_t a_offset,
     throw std::runtime_error("Incompatible shapes for matmul.");
   }
 
-  const float *a_data = static_cast<const float *>(a.data());
-  const float *b_data = static_cast<const float *>(b.data());
-  float *out_data = static_cast<float *>(out.data());
+  DataType a_dt = a.dtype();
+  DataType b_dt = b.dtype();
+  DataType out_dt = out.dtype();
 
-  bool is_a_rm = (a_strides[0] == K && a_strides[1] == 1);
-  bool is_a_trans = (a_strides[0] == 1 && a_strides[1] == M);
-  bool is_b_rm = (b_strides[0] == N && b_strides[1] == 1);
-  bool is_b_trans = (b_strides[0] == 1 && b_strides[1] == K);
-  bool is_out_rm = (out_strides[0] == N && out_strides[1] == 1);
+  const void *a_data = a.data();
+  const void *b_data = b.data();
+  void *out_data = out.data();
 
-  if ((is_a_rm || is_a_trans) && (is_b_rm || is_b_trans) && is_out_rm) {
-    int lda = is_a_rm ? static_cast<int>(K) : static_cast<int>(M);
-    int ldb = is_b_rm ? static_cast<int>(N) : static_cast<int>(K);
-    int ldc = static_cast<int>(N);
-    int transA = is_a_rm ? CblasNoTrans : CblasTrans;
-    int transB = is_b_rm ? CblasNoTrans : CblasTrans;
+  if (a_dt == DataType::FP32 && b_dt == DataType::FP32 && out_dt == DataType::FP32) {
+    bool is_a_rm = (a_strides[0] == K && a_strides[1] == 1);
+    bool is_a_trans = (a_strides[0] == 1 && a_strides[1] == M);
+    bool is_b_rm = (b_strides[0] == N && b_strides[1] == 1);
+    bool is_b_trans = (b_strides[0] == 1 && b_strides[1] == K);
+    bool is_out_rm = (out_strides[0] == N && out_strides[1] == 1);
 
-    cblas_sgemm(CblasRowMajor, transA, transB, static_cast<int>(M),
-                static_cast<int>(N), static_cast<int>(K), 1.0f,
-                a_data + a_offset, lda, b_data + b_offset, ldb, 0.0f,
-                out_data + out_offset, ldc);
-  } else {
-    for (size_t r = 0; r < M; ++r) {
-      for (size_t c = 0; c < N; ++c) {
-        float sum_val = 0.0f;
-        for (size_t k = 0; k < K; ++k) {
-          size_t a_idx = a_offset + r * a_strides[0] + k * a_strides[1];
-          size_t b_idx = b_offset + k * b_strides[0] + c * b_strides[1];
-          sum_val += a_data[a_idx] * b_data[b_idx];
-        }
-        size_t out_idx = out_offset + r * out_strides[0] + c * out_strides[1];
-        out_data[out_idx] = sum_val;
+    if ((is_a_rm || is_a_trans) && (is_b_rm || is_b_trans) && is_out_rm) {
+      int lda = is_a_rm ? static_cast<int>(K) : static_cast<int>(M);
+      int ldb = is_b_rm ? static_cast<int>(N) : static_cast<int>(K);
+      int ldc = static_cast<int>(N);
+      int transA = is_a_rm ? CblasNoTrans : CblasTrans;
+      int transB = is_b_rm ? CblasNoTrans : CblasTrans;
+
+      cblas_sgemm(CblasRowMajor, transA, transB, static_cast<int>(M),
+                  static_cast<int>(N), static_cast<int>(K), 1.0f,
+                  static_cast<const float *>(a_data) + a_offset, lda,
+                  static_cast<const float *>(b_data) + b_offset, ldb, 0.0f,
+                  static_cast<float *>(out_data) + out_offset, ldc);
+      return;
+    }
+  }
+
+  for (size_t r = 0; r < M; ++r) {
+    for (size_t c = 0; c < N; ++c) {
+      float sum_val = 0.0f;
+      for (size_t k = 0; k < K; ++k) {
+        size_t a_idx = a_offset + r * a_strides[0] + k * a_strides[1];
+        size_t b_idx = b_offset + k * b_strides[0] + c * b_strides[1];
+        sum_val += read_value(a_data, a_idx, a_dt) * read_value(b_data, b_idx, b_dt);
       }
+      size_t out_idx = out_offset + r * out_strides[0] + c * out_strides[1];
+      write_value(out_data, out_idx, sum_val, out_dt);
     }
   }
 }
@@ -317,16 +392,18 @@ void CpuBackend::sum(const DeviceBuffer &input, size_t input_offset,
                      const Shape &output_shape, const Strides &output_strides,
                      const std::vector<size_t> &axes) {
   size_t out_elements = count_elements(output_shape);
-  float *out_data = static_cast<float *>(output.data());
+  void *out_data = output.data();
+  DataType out_dt = output.dtype();
 
   for (size_t i = 0; i < out_elements; ++i) {
     size_t out_idx =
         get_input_offset(i, output_shape, output_shape, output_strides);
-    out_data[output_offset + out_idx] = 0.0f;
+    write_value(out_data, output_offset + out_idx, 0.0f, out_dt);
   }
 
   size_t in_elements = count_elements(input_shape);
-  const float *in_data = static_cast<const float *>(input.data());
+  const void *in_data = input.data();
+  DataType in_dt = input.dtype();
 
   for (size_t i = 0; i < in_elements; ++i) {
     size_t temp = i;
@@ -375,7 +452,9 @@ void CpuBackend::sum(const DeviceBuffer &input, size_t input_offset,
       in_idx += in_coords[d] * input_strides[d];
     }
 
-    out_data[output_offset + out_idx] += in_data[input_offset + in_idx];
+    float current_val = read_value(out_data, output_offset + out_idx, out_dt);
+    float input_val = read_value(in_data, input_offset + in_idx, in_dt);
+    write_value(out_data, output_offset + out_idx, current_val + input_val, out_dt);
   }
 }
 
@@ -446,8 +525,10 @@ void CpuBackend::softmax(const DeviceBuffer &in, size_t in_offset,
                          DeviceBuffer &out, size_t out_offset,
                          const Shape &out_shape, const Strides &out_strides,
                          size_t axis) {
-  const float *in_data = static_cast<const float *>(in.data()) + in_offset;
-  float *out_data = static_cast<float *>(out.data()) + out_offset;
+  const void *in_data = in.data();
+  void *out_data = out.data();
+  DataType in_dt = in.dtype();
+  DataType out_dt = out.dtype();
 
   size_t num_elements = count_elements(in_shape);
   size_t axis_size = in_shape[axis];
@@ -480,14 +561,14 @@ void CpuBackend::softmax(const DeviceBuffer &in, size_t in_offset,
     for (size_t idx : slice_indices) {
       size_t in_offset_idx =
           get_input_offset(idx, in_shape, in_shape, in_strides);
-      max_val = std::max(max_val, in_data[in_offset_idx]);
+      max_val = std::max(max_val, read_value(in_data, in_offset + in_offset_idx, in_dt));
     }
 
     float sum_exp = 0.0f;
     for (size_t idx : slice_indices) {
       size_t in_offset_idx =
           get_input_offset(idx, in_shape, in_shape, in_strides);
-      sum_exp += std::exp(in_data[in_offset_idx] - max_val);
+      sum_exp += std::exp(read_value(in_data, in_offset + in_offset_idx, in_dt) - max_val);
     }
 
     for (size_t idx : slice_indices) {
@@ -495,8 +576,8 @@ void CpuBackend::softmax(const DeviceBuffer &in, size_t in_offset,
           get_input_offset(idx, in_shape, in_shape, in_strides);
       size_t out_offset_idx =
           get_input_offset(idx, out_shape, out_shape, out_strides);
-      out_data[out_offset_idx] =
-          std::exp(in_data[in_offset_idx] - max_val) / sum_exp;
+      float out_val = std::exp(read_value(in_data, in_offset + in_offset_idx, in_dt) - max_val) / sum_exp;
+      write_value(out_data, out_offset + out_offset_idx, out_val, out_dt);
     }
   }
 }
@@ -508,10 +589,12 @@ void CpuBackend::softmax_backward(
     const Strides &grad_out_strides, DeviceBuffer &grad_in,
     size_t grad_in_offset, const Shape &grad_in_shape,
     const Strides &grad_in_strides, size_t axis) {
-  const float *out_data = static_cast<const float *>(out.data()) + out_offset;
-  const float *go_data =
-      static_cast<const float *>(grad_out.data()) + grad_out_offset;
-  float *gi_data = static_cast<float *>(grad_in.data()) + grad_in_offset;
+  const void *out_data = out.data();
+  const void *go_data = grad_out.data();
+  void *gi_data = grad_in.data();
+  DataType out_dt = out.dtype();
+  DataType go_dt = grad_out.dtype();
+  DataType gi_dt = grad_in.dtype();
 
   size_t num_elements = count_elements(out_shape);
   size_t axis_size = out_shape[axis];
@@ -546,7 +629,8 @@ void CpuBackend::softmax_backward(
           get_input_offset(idx, out_shape, out_shape, out_strides);
       size_t go_offset_idx =
           get_input_offset(idx, out_shape, grad_out_shape, grad_out_strides);
-      sum_dy_y += go_data[go_offset_idx] * out_data[out_offset_idx];
+      sum_dy_y += read_value(go_data, grad_out_offset + go_offset_idx, go_dt) *
+                  read_value(out_data, out_offset + out_offset_idx, out_dt);
     }
 
     for (size_t idx : slice_indices) {
@@ -556,9 +640,9 @@ void CpuBackend::softmax_backward(
           get_input_offset(idx, out_shape, grad_out_shape, grad_out_strides);
       size_t gi_offset_idx =
           get_input_offset(idx, out_shape, grad_in_shape, grad_in_strides);
-      float y = out_data[out_offset_idx];
-      float dy = go_data[go_offset_idx];
-      gi_data[gi_offset_idx] = y * (dy - sum_dy_y);
+      float y = read_value(out_data, out_offset + out_offset_idx, out_dt);
+      float dy = read_value(go_data, grad_out_offset + go_offset_idx, go_dt);
+      write_value(gi_data, grad_in_offset + gi_offset_idx, y * (dy - sum_dy_y), gi_dt);
     }
   }
 }

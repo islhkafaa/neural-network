@@ -20,6 +20,10 @@ public:
   [[nodiscard]] float lr() const noexcept { return lr_; }
   void set_lr(float lr) noexcept { lr_ = lr; }
 
+  [[nodiscard]] const std::vector<std::shared_ptr<Tensor>> &params() const noexcept {
+    return params_;
+  }
+
 protected:
   std::vector<std::shared_ptr<Tensor>> params_;
   float lr_;

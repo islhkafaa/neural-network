@@ -4,6 +4,15 @@
 #include <DirectML.h>
 #include <d3d12.h>
 
+static DML_TENSOR_DATA_TYPE to_dml_dtype(DataType dtype) {
+  switch (dtype) {
+    case DataType::FP32: return DML_TENSOR_DATA_TYPE_FLOAT32;
+    case DataType::FP16: return DML_TENSOR_DATA_TYPE_FLOAT16;
+    case DataType::BF16: return DML_TENSOR_DATA_TYPE_BFLOAT16;
+  }
+  return DML_TENSOR_DATA_TYPE_FLOAT32;
+}
+
 static void
 ExecuteOperator(IDMLDevice *dmlDevice, IDMLCommandRecorder *recorder,
                 ID3D12GraphicsCommandList *commandList,
@@ -262,21 +271,21 @@ void DmlBackend::add(const DeviceBuffer &a, size_t a_offset,
                      DeviceBuffer &out, size_t out_offset,
                      const Shape &out_shape, const Strides &out_strides) {
 #ifdef WITH_DML
-  DML_TENSOR_DATA_TYPE dataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+  DML_TENSOR_DATA_TYPE dataType = to_dml_dtype(a.dtype());
   DML_TENSOR_FLAGS flags = DML_TENSOR_FLAG_NONE;
 
-  size_t count = out.size() / sizeof(float);
+  size_t count = out_shape.numel();
   UINT64 dims[] = {1, 1, 1, count};
 
   DML_BUFFER_TENSOR_DESC aTensorDesc = {dataType, flags, 4,         dims,
-                                        nullptr,  0,     out.size()};
+                                        nullptr,  0,     a.size()};
   DML_TENSOR_DESC aDesc = {DML_TENSOR_TYPE_BUFFER, &aTensorDesc};
 
-  DML_BUFFER_TENSOR_DESC bTensorDesc = {dataType, flags, 4,         dims,
-                                        nullptr,  0,     out.size()};
+  DML_BUFFER_TENSOR_DESC bTensorDesc = {to_dml_dtype(b.dtype()), flags, 4,         dims,
+                                        nullptr,  0,     b.size()};
   DML_TENSOR_DESC bDesc = {DML_TENSOR_TYPE_BUFFER, &bTensorDesc};
 
-  DML_BUFFER_TENSOR_DESC outTensorDesc = {dataType, flags, 4,         dims,
+  DML_BUFFER_TENSOR_DESC outTensorDesc = {to_dml_dtype(out.dtype()), flags, 4,         dims,
                                           nullptr,  0,     out.size()};
   DML_TENSOR_DESC outDesc = {DML_TENSOR_TYPE_BUFFER, &outTensorDesc};
 
@@ -295,15 +304,15 @@ void DmlBackend::add(const DeviceBuffer &a, size_t a_offset,
   DmlBuffer &dmlOut = static_cast<DmlBuffer &>(out);
 
   DML_BUFFER_BINDING aBinding = {dmlA.resource().Get(),
-                                 a_offset * sizeof(float), out.size()};
+                                 a_offset * dtype_size(a.dtype()), a.size()};
   DML_BINDING_DESC aBindDesc = {DML_BINDING_TYPE_BUFFER, &aBinding};
 
   DML_BUFFER_BINDING bBinding = {dmlB.resource().Get(),
-                                 b_offset * sizeof(float), out.size()};
+                                 b_offset * dtype_size(b.dtype()), b.size()};
   DML_BINDING_DESC bBindDesc = {DML_BINDING_TYPE_BUFFER, &bBinding};
 
   DML_BUFFER_BINDING outBinding = {dmlOut.resource().Get(),
-                                   out_offset * sizeof(float), out.size()};
+                                   out_offset * dtype_size(out.dtype()), out.size()};
   DML_BINDING_DESC outBindDesc = {DML_BINDING_TYPE_BUFFER, &outBinding};
 
   ExecuteOperator(dmlDevice_.Get(), commandRecorder_.Get(), commandList_.Get(),
@@ -348,7 +357,7 @@ void DmlBackend::matmul(const DeviceBuffer &a, size_t a_offset,
                         DeviceBuffer &out, size_t out_offset,
                         const Shape &out_shape, const Strides &out_strides) {
 #ifdef WITH_DML
-  DML_TENSOR_DATA_TYPE dataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+  DML_TENSOR_DATA_TYPE dataType = to_dml_dtype(a.dtype());
   DML_TENSOR_FLAGS flags = DML_TENSOR_FLAG_NONE;
 
   size_t M = a_shape[0];
@@ -361,12 +370,12 @@ void DmlBackend::matmul(const DeviceBuffer &a, size_t a_offset,
   DML_TENSOR_DESC aDesc = {DML_TENSOR_TYPE_BUFFER, &aTensorDesc};
 
   UINT64 bDims[] = {1, 1, K, N};
-  DML_BUFFER_TENSOR_DESC bTensorDesc = {dataType, flags, 4,       bDims,
+  DML_BUFFER_TENSOR_DESC bTensorDesc = {to_dml_dtype(b.dtype()), flags, 4,       bDims,
                                         nullptr,  0,     b.size()};
   DML_TENSOR_DESC bDesc = {DML_TENSOR_TYPE_BUFFER, &bTensorDesc};
 
   UINT64 outDims[] = {1, 1, M, N};
-  DML_BUFFER_TENSOR_DESC outTensorDesc = {dataType, flags, 4,         outDims,
+  DML_BUFFER_TENSOR_DESC outTensorDesc = {to_dml_dtype(out.dtype()), flags, 4,         outDims,
                                           nullptr,  0,     out.size()};
   DML_TENSOR_DESC outDesc = {DML_TENSOR_TYPE_BUFFER, &outTensorDesc};
 
@@ -386,15 +395,15 @@ void DmlBackend::matmul(const DeviceBuffer &a, size_t a_offset,
   DmlBuffer &dmlOut = static_cast<DmlBuffer &>(out);
 
   DML_BUFFER_BINDING aBinding = {dmlA.resource().Get(),
-                                 a_offset * sizeof(float), a.size()};
+                                 a_offset * dtype_size(a.dtype()), a.size()};
   DML_BINDING_DESC aBindDesc = {DML_BINDING_TYPE_BUFFER, &aBinding};
 
   DML_BUFFER_BINDING bBinding = {dmlB.resource().Get(),
-                                 b_offset * sizeof(float), b.size()};
+                                 b_offset * dtype_size(b.dtype()), b.size()};
   DML_BINDING_DESC bBindDesc = {DML_BINDING_TYPE_BUFFER, &bBinding};
 
   DML_BUFFER_BINDING outBinding = {dmlOut.resource().Get(),
-                                   out_offset * sizeof(float), out.size()};
+                                   out_offset * dtype_size(out.dtype()), out.size()};
   DML_BINDING_DESC outBindDesc = {DML_BINDING_TYPE_BUFFER, &outBinding};
 
   ExecuteOperator(dmlDevice_.Get(), commandRecorder_.Get(), commandList_.Get(),
@@ -426,18 +435,18 @@ void DmlBackend::relu(const DeviceBuffer &in, size_t in_offset,
                       DeviceBuffer &out, size_t out_offset,
                       const Shape &out_shape, const Strides &out_strides) {
 #ifdef WITH_DML
-  DML_TENSOR_DATA_TYPE dataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+  DML_TENSOR_DATA_TYPE dataType = to_dml_dtype(in.dtype());
   DML_TENSOR_FLAGS flags = DML_TENSOR_FLAG_NONE;
 
-  size_t count = out.size() / sizeof(float);
+  size_t count = out_shape.numel();
   UINT64 dims[] = {1, 1, 1, count};
 
   DML_BUFFER_TENSOR_DESC inTensorDesc = {dataType, flags, 4,         dims,
-                                         nullptr,  0,     out.size()};
+                                         nullptr,  0,     in.size()};
   DML_TENSOR_DESC inDesc = {DML_TENSOR_TYPE_BUFFER, &inTensorDesc};
 
-  DML_BUFFER_TENSOR_DESC outTensorDesc = {dataType, flags, 4,         dims,
-                                          nullptr,  0,     out.size()};
+  DML_BUFFER_TENSOR_DESC outTensorDesc = {to_dml_dtype(out.dtype()), flags, 4,         dims,
+                                           nullptr,  0,     out.size()};
   DML_TENSOR_DESC outDesc = {DML_TENSOR_TYPE_BUFFER, &outTensorDesc};
 
   DML_ACTIVATION_RELU_OPERATOR_DESC reluDesc = {&inDesc, &outDesc};
@@ -454,11 +463,11 @@ void DmlBackend::relu(const DeviceBuffer &in, size_t in_offset,
   DmlBuffer &dmlOut = static_cast<DmlBuffer &>(out);
 
   DML_BUFFER_BINDING inBinding = {dmlIn.resource().Get(),
-                                  in_offset * sizeof(float), out.size()};
+                                  in_offset * dtype_size(in.dtype()), in.size()};
   DML_BINDING_DESC inBindDesc = {DML_BINDING_TYPE_BUFFER, &inBinding};
 
   DML_BUFFER_BINDING outBinding = {dmlOut.resource().Get(),
-                                   out_offset * sizeof(float), out.size()};
+                                   out_offset * dtype_size(out.dtype()), out.size()};
   DML_BINDING_DESC outBindDesc = {DML_BINDING_TYPE_BUFFER, &outBinding};
 
   ExecuteOperator(dmlDevice_.Get(), commandRecorder_.Get(), commandList_.Get(),

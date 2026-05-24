@@ -112,59 +112,115 @@ reduce_grad_for_broadcasting(const std::shared_ptr<Tensor> &grad,
     return std::make_shared<Tensor>(
         target_shape,
         broadcast_strides(reduced->shape(), reduced->strides(), target_shape),
-        reduced->offset(), reduced->storage(), reduced->backend());
+        reduced->offset(), reduced->storage(), reduced->backend(), reduced->dtype());
   }
   return reduced;
 }
 
-Tensor::Tensor(const Shape &shape, ExecutionBackend *backend)
+Tensor::Tensor(const Shape &shape, ExecutionBackend *backend, DataType dtype)
     : shape_(shape), strides_(compute_strides(shape)), offset_(0),
-      backend_(backend ? backend : default_backend()) {
-  storage_ = backend_->allocate(count_elements(shape_) * sizeof(float));
+      backend_(backend ? backend : default_backend()), dtype_(dtype) {
+  storage_ = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  storage_->set_dtype(dtype_);
 }
 
 Tensor::Tensor(const Shape &shape, const std::vector<float> &host_data,
-               ExecutionBackend *backend)
+               ExecutionBackend *backend, DataType dtype)
     : shape_(shape), strides_(compute_strides(shape)), offset_(0),
-      backend_(backend ? backend : default_backend()) {
+      backend_(backend ? backend : default_backend()), dtype_(dtype) {
   if (host_data.size() != count_elements(shape_)) {
     throw std::runtime_error("Data size mismatch during tensor construction.");
   }
-  storage_ = backend_->allocate(count_elements(shape_) * sizeof(float));
-  backend_->copy_host_to_device(host_data.data(), *storage_,
-                                host_data.size() * sizeof(float));
+  storage_ = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  storage_->set_dtype(dtype_);
+  if (dtype_ == DataType::FP32) {
+    backend_->copy_host_to_device(host_data.data(), *storage_,
+                                  host_data.size() * sizeof(float));
+  } else {
+    std::vector<uint16_t> half_data(host_data.size());
+    if (dtype_ == DataType::FP16) {
+      for (size_t i = 0; i < host_data.size(); ++i) {
+        half_data[i] = float_to_fp16(host_data[i]);
+      }
+    } else {
+      for (size_t i = 0; i < host_data.size(); ++i) {
+        half_data[i] = float_to_bfloat16(host_data[i]);
+      }
+    }
+    backend_->copy_host_to_device(reinterpret_cast<const float *>(half_data.data()), *storage_,
+                                  host_data.size() * sizeof(uint16_t));
+  }
 }
 
 Tensor::Tensor(const Shape &shape, const Strides &strides, size_t offset,
-               std::shared_ptr<DeviceBuffer> storage, ExecutionBackend *backend)
+               std::shared_ptr<DeviceBuffer> storage, ExecutionBackend *backend, DataType dtype)
     : shape_(shape), strides_(strides), offset_(offset),
       storage_(std::move(storage)),
-      backend_(backend ? backend : default_backend()) {}
+      backend_(backend ? backend : default_backend()), dtype_(dtype) {
+  if (storage_) {
+    storage_->set_dtype(dtype_);
+  }
+}
 
 std::vector<float> Tensor::to_host() const {
   size_t size = count_elements(shape_);
   std::vector<float> host_data(size);
-  std::vector<float> full_buf(storage_->size() / sizeof(float));
-  backend_->copy_device_to_host(*storage_, full_buf.data(), storage_->size());
-  for (size_t i = 0; i < size; ++i) {
-    size_t idx = get_input_offset(i, shape_, shape_, strides_);
-    host_data[i] = full_buf[offset_ + idx];
+  if (dtype_ == DataType::FP32) {
+    std::vector<float> full_buf(storage_->size() / sizeof(float));
+    backend_->copy_device_to_host(*storage_, full_buf.data(), storage_->size());
+    for (size_t i = 0; i < size; ++i) {
+      size_t idx = get_input_offset(i, shape_, shape_, strides_);
+      host_data[i] = full_buf[offset_ + idx];
+    }
+  } else {
+    std::vector<uint16_t> full_buf(storage_->size() / sizeof(uint16_t));
+    backend_->copy_device_to_host(*storage_, reinterpret_cast<float *>(full_buf.data()), storage_->size());
+    if (dtype_ == DataType::FP16) {
+      for (size_t i = 0; i < size; ++i) {
+        size_t idx = get_input_offset(i, shape_, shape_, strides_);
+        host_data[i] = fp16_to_float(full_buf[offset_ + idx]);
+      }
+    } else {
+      for (size_t i = 0; i < size; ++i) {
+        size_t idx = get_input_offset(i, shape_, shape_, strides_);
+        host_data[i] = bfloat16_to_float(full_buf[offset_ + idx]);
+      }
+    }
   }
   return host_data;
 }
 
 void Tensor::fill(float value) {
   if (is_contiguous(shape_, strides_)) {
-    backend_->fill(*storage_, value);
-  } else {
-    std::vector<float> full_buf(storage_->size() / sizeof(float));
-    backend_->copy_device_to_host(*storage_, full_buf.data(), storage_->size());
-    size_t size = count_elements(shape_);
-    for (size_t i = 0; i < size; ++i) {
-      size_t idx = get_input_offset(i, shape_, shape_, strides_);
-      full_buf[offset_ + idx] = value;
+    if (dtype_ == DataType::FP32 || value == 0.0f) {
+      backend_->fill(*storage_, value);
+    } else {
+      uint16_t half_val = (dtype_ == DataType::FP16) ? float_to_fp16(value) : float_to_bfloat16(value);
+      std::vector<uint16_t> half_data(count_elements(shape_), half_val);
+      backend_->copy_host_to_device(reinterpret_cast<const float *>(half_data.data()), *storage_,
+                                    half_data.size() * sizeof(uint16_t));
     }
-    backend_->copy_host_to_device(full_buf.data(), *storage_, storage_->size());
+  } else {
+    if (dtype_ == DataType::FP32) {
+      std::vector<float> full_buf(storage_->size() / sizeof(float));
+      backend_->copy_device_to_host(*storage_, full_buf.data(), storage_->size());
+      size_t size = count_elements(shape_);
+      for (size_t i = 0; i < size; ++i) {
+        size_t idx = get_input_offset(i, shape_, shape_, strides_);
+        full_buf[offset_ + idx] = value;
+      }
+      backend_->copy_host_to_device(full_buf.data(), *storage_, storage_->size());
+    } else {
+      std::vector<uint16_t> full_buf(storage_->size() / sizeof(uint16_t));
+      backend_->copy_device_to_host(*storage_, reinterpret_cast<float *>(full_buf.data()), storage_->size());
+      uint16_t half_val = (dtype_ == DataType::FP16) ? float_to_fp16(value) : float_to_bfloat16(value);
+      size_t size = count_elements(shape_);
+      for (size_t i = 0; i < size; ++i) {
+        size_t idx = get_input_offset(i, shape_, shape_, strides_);
+        full_buf[offset_ + idx] = half_val;
+      }
+      backend_->copy_host_to_device(reinterpret_cast<const float *>(full_buf.data()), *storage_, storage_->size());
+    }
   }
 }
 
@@ -172,25 +228,52 @@ void Tensor::copy_from_host(const std::vector<float> &host_data) {
   if (host_data.size() != count_elements(shape_)) {
     throw std::runtime_error("Size mismatch in copy_from_host");
   }
-  if (is_contiguous(shape_, strides_)) {
-    backend_->copy_host_to_device(host_data.data(), *storage_,
-                                  host_data.size() * sizeof(float));
-  } else {
-    std::vector<float> full_buf(storage_->size() / sizeof(float));
-    backend_->copy_device_to_host(*storage_, full_buf.data(), storage_->size());
-    size_t size = count_elements(shape_);
-    for (size_t i = 0; i < size; ++i) {
-      size_t idx = get_input_offset(i, shape_, shape_, strides_);
-      full_buf[offset_ + idx] = host_data[i];
+  if (dtype_ == DataType::FP32) {
+    if (is_contiguous(shape_, strides_)) {
+      backend_->copy_host_to_device(host_data.data(), *storage_,
+                                    host_data.size() * sizeof(float));
+    } else {
+      std::vector<float> full_buf(storage_->size() / sizeof(float));
+      backend_->copy_device_to_host(*storage_, full_buf.data(), storage_->size());
+      size_t size = count_elements(shape_);
+      for (size_t i = 0; i < size; ++i) {
+        size_t idx = get_input_offset(i, shape_, shape_, strides_);
+        full_buf[offset_ + idx] = host_data[i];
+      }
+      backend_->copy_host_to_device(full_buf.data(), *storage_, storage_->size());
     }
-    backend_->copy_host_to_device(full_buf.data(), *storage_, storage_->size());
+  } else {
+    std::vector<uint16_t> half_data(host_data.size());
+    if (dtype_ == DataType::FP16) {
+      for (size_t i = 0; i < host_data.size(); ++i) {
+        half_data[i] = float_to_fp16(host_data[i]);
+      }
+    } else {
+      for (size_t i = 0; i < host_data.size(); ++i) {
+        half_data[i] = float_to_bfloat16(host_data[i]);
+      }
+    }
+    if (is_contiguous(shape_, strides_)) {
+      backend_->copy_host_to_device(reinterpret_cast<const float *>(half_data.data()), *storage_,
+                                    half_data.size() * sizeof(uint16_t));
+    } else {
+      std::vector<uint16_t> full_buf(storage_->size() / sizeof(uint16_t));
+      backend_->copy_device_to_host(*storage_, reinterpret_cast<float *>(full_buf.data()), storage_->size());
+      size_t size = count_elements(shape_);
+      for (size_t i = 0; i < size; ++i) {
+        size_t idx = get_input_offset(i, shape_, shape_, strides_);
+        full_buf[offset_ + idx] = half_data[i];
+      }
+      backend_->copy_host_to_device(reinterpret_cast<const float *>(full_buf.data()), *storage_, storage_->size());
+    }
   }
 }
 
 std::shared_ptr<Tensor> Tensor::add(const std::shared_ptr<Tensor> &other) {
   Shape out_shape = broadcast_shapes(shape_, other->shape());
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->add(*storage_, offset_, shape_, strides_, *other->storage(),
@@ -198,7 +281,7 @@ std::shared_ptr<Tensor> Tensor::add(const std::shared_ptr<Tensor> &other) {
                 0, out_shape, out_strides);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_ || other->requires_grad_;
   if (out->requires_grad_) {
     out->inputs_ = {shared_from_this(), other};
@@ -219,7 +302,8 @@ std::shared_ptr<Tensor> Tensor::add(const std::shared_ptr<Tensor> &other) {
 std::shared_ptr<Tensor> Tensor::sub(const std::shared_ptr<Tensor> &other) {
   Shape out_shape = broadcast_shapes(shape_, other->shape());
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->sub(*storage_, offset_, shape_, strides_, *other->storage(),
@@ -227,7 +311,7 @@ std::shared_ptr<Tensor> Tensor::sub(const std::shared_ptr<Tensor> &other) {
                 0, out_shape, out_strides);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_ || other->requires_grad_;
   if (out->requires_grad_) {
     out->inputs_ = {shared_from_this(), other};
@@ -248,7 +332,8 @@ std::shared_ptr<Tensor> Tensor::sub(const std::shared_ptr<Tensor> &other) {
 std::shared_ptr<Tensor> Tensor::mul(const std::shared_ptr<Tensor> &other) {
   Shape out_shape = broadcast_shapes(shape_, other->shape());
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->mul(*storage_, offset_, shape_, strides_, *other->storage(),
@@ -256,7 +341,7 @@ std::shared_ptr<Tensor> Tensor::mul(const std::shared_ptr<Tensor> &other) {
                 0, out_shape, out_strides);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_ || other->requires_grad_;
   if (out->requires_grad_) {
     out->inputs_ = {shared_from_this(), other};
@@ -277,7 +362,8 @@ std::shared_ptr<Tensor> Tensor::mul(const std::shared_ptr<Tensor> &other) {
 std::shared_ptr<Tensor> Tensor::div(const std::shared_ptr<Tensor> &other) {
   Shape out_shape = broadcast_shapes(shape_, other->shape());
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->div(*storage_, offset_, shape_, strides_, *other->storage(),
@@ -285,7 +371,7 @@ std::shared_ptr<Tensor> Tensor::div(const std::shared_ptr<Tensor> &other) {
                 0, out_shape, out_strides);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_ || other->requires_grad_;
   if (out->requires_grad_) {
     out->inputs_ = {shared_from_this(), other};
@@ -316,7 +402,8 @@ std::shared_ptr<Tensor> Tensor::matmul(const std::shared_ptr<Tensor> &other) {
   }
 
   Shape out_shape = {M, N};
-  auto out_storage = backend_->allocate(M * N * sizeof(float));
+  auto out_storage = backend_->allocate(M * N * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->matmul(*storage_, offset_, shape_, strides_, *other->storage(),
@@ -324,7 +411,7 @@ std::shared_ptr<Tensor> Tensor::matmul(const std::shared_ptr<Tensor> &other) {
                    *out_storage, 0, out_shape, out_strides);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_ || other->requires_grad_;
   if (out->requires_grad_) {
     out->inputs_ = {shared_from_this(), other};
@@ -370,14 +457,15 @@ std::shared_ptr<Tensor> Tensor::sum(const std::vector<size_t> &axes,
   }
 
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->sum(*storage_, offset_, shape_, strides_, *out_storage, 0,
                 out_shape, out_strides, axes);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
@@ -390,7 +478,7 @@ std::shared_ptr<Tensor> Tensor::sum(const std::vector<size_t> &axes,
               expanded_shape,
               broadcast_strides(out->grad()->shape(), out->grad()->strides(),
                                 expanded_shape),
-              out->grad()->offset(), out->grad()->storage(), out->backend());
+              out->grad()->offset(), out->grad()->storage(), out->backend(), out->dtype());
         }
         self->accumulate_grad(incoming);
       }
@@ -416,7 +504,7 @@ std::shared_ptr<Tensor> Tensor::transpose(size_t dim1, size_t dim2) {
   std::swap(trans_strides[dim1], trans_strides[dim2]);
 
   auto out = std::make_shared<Tensor>(trans_shape, trans_strides, offset_,
-                                      storage_, backend_);
+                                      storage_, backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
@@ -437,13 +525,13 @@ std::shared_ptr<Tensor> Tensor::reshape(const Shape &new_shape) {
   std::shared_ptr<Tensor> base = shared_from_this();
   if (offset_ != 0 || !is_contiguous(shape_, strides_)) {
     auto contiguous_tensor =
-        std::make_shared<Tensor>(shape_, to_host(), backend_);
+        std::make_shared<Tensor>(shape_, to_host(), backend_, dtype_);
     base = contiguous_tensor;
   }
 
   auto out_strides = compute_strides(new_shape);
   auto out = std::make_shared<Tensor>(new_shape, out_strides, base->offset(),
-                                      base->storage(), backend_);
+                                      base->storage(), backend_, base->dtype());
 
   out->requires_grad_ = requires_grad_;
   if (out->requires_grad_) {
@@ -488,20 +576,22 @@ std::shared_ptr<Tensor> Tensor::bmm(const std::shared_ptr<Tensor> &other) {
 }
 
 std::shared_ptr<Tensor> Tensor::relu() {
-  auto out_storage = backend_->allocate(count_elements(shape_) * sizeof(float));
+  auto out_storage = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(shape_);
   backend_->relu(*storage_, offset_, shape_, strides_, *out_storage, 0, shape_,
                  out_strides);
 
   auto out = std::make_shared<Tensor>(shape_, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
     out->backward_ = [self = shared_from_this(), out]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        grad_in_storage->set_dtype(self->dtype());
         Strides gi_strides = compute_strides(self->shape());
         self->backend()->relu_backward(
             *self->storage(), self->offset(), self->shape(), self->strides(),
@@ -510,7 +600,7 @@ std::shared_ptr<Tensor> Tensor::relu() {
             self->shape(), gi_strides);
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -519,20 +609,22 @@ std::shared_ptr<Tensor> Tensor::relu() {
 }
 
 std::shared_ptr<Tensor> Tensor::sigmoid() {
-  auto out_storage = backend_->allocate(count_elements(shape_) * sizeof(float));
+  auto out_storage = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(shape_);
   backend_->sigmoid(*storage_, offset_, shape_, strides_, *out_storage, 0,
                     shape_, out_strides);
 
   auto out = std::make_shared<Tensor>(shape_, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
     out->backward_ = [self = shared_from_this(), out]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        grad_in_storage->set_dtype(self->dtype());
         Strides gi_strides = compute_strides(self->shape());
         self->backend()->sigmoid_backward(
             *out->storage(), out->offset(), out->shape(), out->strides(),
@@ -541,7 +633,7 @@ std::shared_ptr<Tensor> Tensor::sigmoid() {
             self->shape(), gi_strides);
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -550,20 +642,22 @@ std::shared_ptr<Tensor> Tensor::sigmoid() {
 }
 
 std::shared_ptr<Tensor> Tensor::tanh() {
-  auto out_storage = backend_->allocate(count_elements(shape_) * sizeof(float));
+  auto out_storage = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(shape_);
   backend_->tanh(*storage_, offset_, shape_, strides_, *out_storage, 0, shape_,
                  out_strides);
 
   auto out = std::make_shared<Tensor>(shape_, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
     out->backward_ = [self = shared_from_this(), out]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        grad_in_storage->set_dtype(self->dtype());
         Strides gi_strides = compute_strides(self->shape());
         self->backend()->tanh_backward(
             *out->storage(), out->offset(), out->shape(), out->strides(),
@@ -572,7 +666,7 @@ std::shared_ptr<Tensor> Tensor::tanh() {
             self->shape(), gi_strides);
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -584,20 +678,22 @@ std::shared_ptr<Tensor> Tensor::softmax(size_t axis) {
   if (axis >= shape_.size()) {
     throw std::runtime_error("Axis out of bounds for softmax.");
   }
-  auto out_storage = backend_->allocate(count_elements(shape_) * sizeof(float));
+  auto out_storage = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(shape_);
   backend_->softmax(*storage_, offset_, shape_, strides_, *out_storage, 0,
                     shape_, out_strides, axis);
 
   auto out = std::make_shared<Tensor>(shape_, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
     out->backward_ = [self = shared_from_this(), out, axis]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        grad_in_storage->set_dtype(self->dtype());
         Strides gi_strides = compute_strides(self->shape());
         self->backend()->softmax_backward(
             *out->storage(), out->offset(), out->shape(), out->strides(),
@@ -606,7 +702,7 @@ std::shared_ptr<Tensor> Tensor::softmax(size_t axis) {
             self->shape(), gi_strides, axis);
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -615,20 +711,20 @@ std::shared_ptr<Tensor> Tensor::softmax(size_t axis) {
 }
 
 std::shared_ptr<Tensor> Tensor::sqrt() {
-  auto out_storage = backend_->allocate(count_elements(shape_) * sizeof(float));
+  auto out_storage = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
   Strides out_strides = compute_strides(shape_);
   backend_->sqrt(*storage_, offset_, shape_, strides_, *out_storage, 0, shape_,
                  out_strides);
 
   auto out = std::make_shared<Tensor>(shape_, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
     out->backward_ = [self = shared_from_this(), out]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
         Strides gi_strides = compute_strides(self->shape());
         self->backend()->sqrt_backward(
             *out->storage(), out->offset(), out->shape(), out->strides(),
@@ -637,7 +733,7 @@ std::shared_ptr<Tensor> Tensor::sqrt() {
             self->shape(), gi_strides);
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -646,20 +742,22 @@ std::shared_ptr<Tensor> Tensor::sqrt() {
 }
 
 std::shared_ptr<Tensor> Tensor::log() {
-  auto out_storage = backend_->allocate(count_elements(shape_) * sizeof(float));
+  auto out_storage = backend_->allocate(count_elements(shape_) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(shape_);
   backend_->log(*storage_, offset_, shape_, strides_, *out_storage, 0, shape_,
                 out_strides);
 
   auto out = std::make_shared<Tensor>(shape_, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
   if (requires_grad_) {
     out->inputs_ = {shared_from_this()};
     out->backward_ = [self = shared_from_this(), out]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        grad_in_storage->set_dtype(self->dtype());
         Strides gi_strides = compute_strides(self->shape());
         self->backend()->log_backward(
             *self->storage(), self->offset(), self->shape(), self->strides(),
@@ -668,7 +766,7 @@ std::shared_ptr<Tensor> Tensor::log() {
             self->shape(), gi_strides);
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -695,7 +793,8 @@ std::shared_ptr<Tensor> Tensor::conv2d(const std::shared_ptr<Tensor> &weight,
 
   Shape out_shape = {N, C_out, H_out, W_out};
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->conv2d(*storage_, offset_, shape_, strides_, *weight->storage(),
@@ -705,7 +804,7 @@ std::shared_ptr<Tensor> Tensor::conv2d(const std::shared_ptr<Tensor> &weight,
                    padding, stride);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ =
       requires_grad_ || weight->requires_grad() || bias->requires_grad();
 
@@ -714,15 +813,18 @@ std::shared_ptr<Tensor> Tensor::conv2d(const std::shared_ptr<Tensor> &weight,
     out->backward_ = [self = shared_from_this(), weight, bias, out, padding,
                       stride]() {
       auto grad_in_storage = self->backend()->allocate(
-          count_elements(self->shape()) * sizeof(float));
+          count_elements(self->shape()) * dtype_size(self->dtype()));
+      grad_in_storage->set_dtype(self->dtype());
       Strides gi_strides = compute_strides(self->shape());
 
       auto grad_w_storage = weight->backend()->allocate(
-          count_elements(weight->shape()) * sizeof(float));
+          count_elements(weight->shape()) * dtype_size(weight->dtype()));
+      grad_w_storage->set_dtype(weight->dtype());
       Strides gw_strides = compute_strides(weight->shape());
 
       auto grad_b_storage = bias->backend()->allocate(
-          count_elements(bias->shape()) * sizeof(float));
+          count_elements(bias->shape()) * dtype_size(bias->dtype()));
+      grad_b_storage->set_dtype(bias->dtype());
       Strides gb_strides = compute_strides(bias->shape());
 
       self->backend()->conv2d_backward(
@@ -737,19 +839,19 @@ std::shared_ptr<Tensor> Tensor::conv2d(const std::shared_ptr<Tensor> &weight,
       if (self->requires_grad_) {
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
       if (weight->requires_grad()) {
         auto grad_w = std::make_shared<Tensor>(weight->shape(), gw_strides, 0,
                                                std::move(grad_w_storage),
-                                               weight->backend());
+                                               weight->backend(), weight->dtype());
         weight->accumulate_grad(grad_w);
       }
       if (bias->requires_grad()) {
         auto grad_b = std::make_shared<Tensor>(bias->shape(), gb_strides, 0,
                                                std::move(grad_b_storage),
-                                               bias->backend());
+                                               bias->backend(), bias->dtype());
         bias->accumulate_grad(grad_b);
       }
     };
@@ -772,14 +874,15 @@ std::shared_ptr<Tensor> Tensor::maxpool2d(size_t pool_h, size_t pool_w,
 
   Shape out_shape = {N, C, H_out, W_out};
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(dtype_));
+  out_storage->set_dtype(dtype_);
   Strides out_strides = compute_strides(out_shape);
 
   backend_->maxpool2d(*storage_, offset_, shape_, strides_, *out_storage, 0,
                       out_shape, out_strides, pool_h, pool_w, stride);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, dtype_);
   out->requires_grad_ = requires_grad_;
 
   if (requires_grad_) {
@@ -788,7 +891,8 @@ std::shared_ptr<Tensor> Tensor::maxpool2d(size_t pool_h, size_t pool_w,
                       stride]() {
       if (self->requires_grad_) {
         auto grad_in_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        grad_in_storage->set_dtype(self->dtype());
         Strides gi_strides = compute_strides(self->shape());
 
         self->backend()->maxpool2d_backward(
@@ -800,7 +904,7 @@ std::shared_ptr<Tensor> Tensor::maxpool2d(size_t pool_h, size_t pool_w,
 
         auto grad_in = std::make_shared<Tensor>(self->shape(), gi_strides, 0,
                                                 std::move(grad_in_storage),
-                                                self->backend());
+                                                self->backend(), self->dtype());
         self->accumulate_grad(grad_in);
       }
     };
@@ -825,7 +929,8 @@ Tensor::embedding(const std::shared_ptr<Tensor> &weight) {
 
   Shape out_shape = {N, T, D};
   auto out_storage =
-      backend_->allocate(count_elements(out_shape) * sizeof(float));
+      backend_->allocate(count_elements(out_shape) * dtype_size(weight->dtype()));
+  out_storage->set_dtype(weight->dtype());
   Strides out_strides = compute_strides(out_shape);
 
   backend_->embedding(*weight->storage(), weight->offset(), weight->shape(),
@@ -833,7 +938,7 @@ Tensor::embedding(const std::shared_ptr<Tensor> &weight) {
                       *out_storage, 0, out_shape, out_strides);
 
   auto out = std::make_shared<Tensor>(out_shape, out_strides, 0,
-                                      std::move(out_storage), backend_);
+                                      std::move(out_storage), backend_, weight->dtype());
   out->requires_grad_ = weight->requires_grad();
 
   if (out->requires_grad_) {
@@ -841,7 +946,8 @@ Tensor::embedding(const std::shared_ptr<Tensor> &weight) {
     out->backward_ = [self = shared_from_this(), weight, out]() {
       if (weight->requires_grad()) {
         auto grad_w_storage = weight->backend()->allocate(
-            count_elements(weight->shape()) * sizeof(float));
+            count_elements(weight->shape()) * dtype_size(weight->dtype()));
+        grad_w_storage->set_dtype(weight->dtype());
         Strides gw_strides = compute_strides(weight->shape());
 
         self->backend()->embedding_backward(
@@ -852,7 +958,7 @@ Tensor::embedding(const std::shared_ptr<Tensor> &weight) {
 
         auto grad_w = std::make_shared<Tensor>(weight->shape(), gw_strides, 0,
                                                std::move(grad_w_storage),
-                                               weight->backend());
+                                               weight->backend(), weight->dtype());
         weight->accumulate_grad(grad_w);
       }
     };
@@ -888,7 +994,7 @@ std::shared_ptr<Tensor> Tensor::slice(size_t axis, size_t index) {
   size_t new_offset = offset_ + index * strides_[axis];
 
   auto out = std::make_shared<Tensor>(new_shape, new_strides, new_offset,
-                                      storage_, backend_);
+                                      storage_, backend_, dtype_);
   out->requires_grad_ = requires_grad_;
 
   if (out->requires_grad_) {
@@ -896,10 +1002,9 @@ std::shared_ptr<Tensor> Tensor::slice(size_t axis, size_t index) {
     out->backward_ = [self = shared_from_this(), out, axis, index]() {
       if (self->requires_grad_) {
         auto gp_storage = self->backend()->allocate(
-            count_elements(self->shape()) * sizeof(float));
-        std::vector<float> zeros(count_elements(self->shape()), 0.0f);
-        self->backend()->copy_to_device(zeros.data(), *gp_storage, 0,
-                                        zeros.size() * sizeof(float));
+            count_elements(self->shape()) * dtype_size(self->dtype()));
+        gp_storage->set_dtype(self->dtype());
+        self->backend()->fill(*gp_storage, 0.0f);
 
         Strides gp_strides = compute_strides(self->shape());
         self->backend()->slice_backward(
@@ -909,7 +1014,7 @@ std::shared_ptr<Tensor> Tensor::slice(size_t axis, size_t index) {
 
         auto parent_grad =
             std::make_shared<Tensor>(self->shape(), gp_strides, 0,
-                                     std::move(gp_storage), self->backend());
+                                     std::move(gp_storage), self->backend(), self->dtype());
         self->accumulate_grad(parent_grad);
       }
     };
@@ -925,7 +1030,7 @@ void Tensor::backward() {
 
   if (!grad_) {
     grad_ =
-        std::make_shared<Tensor>(Shape{}, std::vector<float>{1.0f}, backend_);
+        std::make_shared<Tensor>(Shape{}, std::vector<float>{1.0f}, backend_, dtype_);
   } else {
     grad_->fill(1.0f);
   }
@@ -943,7 +1048,7 @@ void Tensor::accumulate_grad(const std::shared_ptr<Tensor> &incoming_grad) {
   if (!requires_grad_)
     return;
   if (!grad_) {
-    grad_ = std::make_shared<Tensor>(shape_, backend_);
+    grad_ = std::make_shared<Tensor>(shape_, backend_, dtype_);
     grad_->fill(0.0f);
   }
   backend_->add(*grad_->storage(), grad_->offset(), grad_->shape(),
@@ -963,19 +1068,37 @@ Tensor::stack(const std::vector<std::shared_ptr<Tensor>> &tensors) {
   out_shape.insert(out_shape.end(), base_shape.begin(), base_shape.end());
 
   size_t single_elements = count_elements(base_shape);
+  DataType dt = tensors[0]->dtype();
   auto out_storage = tensors[0]->backend()->allocate(count_elements(out_shape) *
-                                                     sizeof(float));
+                                                     dtype_size(dt));
+  out_storage->set_dtype(dt);
 
   for (size_t i = 0; i < tensors.size(); ++i) {
     std::vector<float> host_data = tensors[i]->to_host();
-    tensors[0]->backend()->copy_to_device(host_data.data(), *out_storage,
-                                          i * single_elements * sizeof(float),
-                                          single_elements * sizeof(float));
+    if (dt == DataType::FP32) {
+      tensors[0]->backend()->copy_to_device(host_data.data(), *out_storage,
+                                            i * single_elements * sizeof(float),
+                                            single_elements * sizeof(float));
+    } else {
+      std::vector<uint16_t> half_data(host_data.size());
+      if (dt == DataType::FP16) {
+        for (size_t j = 0; j < host_data.size(); ++j) {
+          half_data[j] = float_to_fp16(host_data[j]);
+        }
+      } else {
+        for (size_t j = 0; j < host_data.size(); ++j) {
+          half_data[j] = float_to_bfloat16(host_data[j]);
+        }
+      }
+      tensors[0]->backend()->copy_to_device(reinterpret_cast<const float *>(half_data.data()), *out_storage,
+                                            i * single_elements * sizeof(uint16_t),
+                                            single_elements * sizeof(uint16_t));
+    }
   }
 
   Strides out_strides = compute_strides(out_shape);
   auto out = std::make_shared<Tensor>(
-      out_shape, out_strides, 0, std::move(out_storage), tensors[0]->backend());
+      out_shape, out_strides, 0, std::move(out_storage), tensors[0]->backend(), dt);
 
   bool req_grad = false;
   for (const auto &t : tensors) {
@@ -987,20 +1110,10 @@ Tensor::stack(const std::vector<std::shared_ptr<Tensor>> &tensors) {
 
   if (out->requires_grad()) {
     out->inputs_ = tensors;
-    out->backward_ = [tensors, out, single_elements]() {
+    out->backward_ = [tensors, out]() {
       for (size_t i = 0; i < tensors.size(); ++i) {
         if (tensors[i]->requires_grad()) {
-          auto gs_storage =
-              tensors[i]->backend()->allocate(single_elements * sizeof(float));
-          const float *src_ptr =
-              static_cast<const float *>(out->grad()->storage()->data()) +
-              out->grad()->offset() + i * single_elements;
-          tensors[i]->backend()->copy_to_device(
-              src_ptr, *gs_storage, 0, single_elements * sizeof(float));
-          Strides gs_strides = compute_strides(tensors[i]->shape());
-          auto gs_tensor = std::make_shared<Tensor>(
-              tensors[i]->shape(), gs_strides, 0, std::move(gs_storage),
-              tensors[i]->backend());
+          auto gs_tensor = out->grad()->slice(0, i);
           tensors[i]->accumulate_grad(gs_tensor);
         }
       }
@@ -1109,5 +1222,27 @@ std::shared_ptr<Tensor> Tensor::rope(size_t S_past) {
     };
   }
 
+  return out;
+}
+
+std::shared_ptr<Tensor> Tensor::to(DataType target_dtype) {
+  if (dtype_ == target_dtype) {
+    return shared_from_this();
+  }
+
+  std::vector<float> fp32_data = to_host();
+  auto out = std::make_shared<Tensor>(shape_, backend_, target_dtype);
+  out->copy_from_host(fp32_data);
+
+  out->requires_grad_ = requires_grad_;
+  if (requires_grad_) {
+    out->inputs_ = {shared_from_this()};
+    out->backward_ = [self = shared_from_this(), out]() {
+      if (self->requires_grad_ && out->grad()) {
+        auto grad_in = out->grad()->to(self->dtype());
+        self->accumulate_grad(grad_in);
+      }
+    };
+  }
   return out;
 }

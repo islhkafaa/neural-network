@@ -2,6 +2,7 @@
 #define BACKEND_HPP
 
 #include "core/shape.hpp"
+#include "core/dtype.hpp"
 #include <memory>
 #include <vector>
 
@@ -11,6 +12,9 @@ public:
   [[nodiscard]] virtual size_t size() const noexcept = 0;
   [[nodiscard]] virtual void *data() noexcept = 0;
   [[nodiscard]] virtual const void *data() const noexcept = 0;
+
+  [[nodiscard]] virtual DataType dtype() const noexcept { return DataType::FP32; }
+  virtual void set_dtype(DataType) noexcept {}
 };
 
 class ExecutionBackend {

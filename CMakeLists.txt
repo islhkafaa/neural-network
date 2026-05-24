@@ -29,6 +29,8 @@ set(NEURAL_NETWORK_SOURCES
     src/optim/trainer.cpp
     src/core/serialization.cpp
     src/backend/thread_pool.cpp
+    src/optim/grad_scaler.cpp
+    src/nn/lora.cpp
 )
 
 if(WITH_DML)
@@ -90,3 +92,11 @@ add_test(NAME RopeSwigluTest COMMAND rope_swiglu_test)
 add_executable(parallel_test tests/backend/parallel_test.cpp)
 target_link_libraries(parallel_test PRIVATE neural_network GTest::gtest GTest::gtest_main)
 add_test(NAME ParallelTest COMMAND parallel_test)
+
+add_executable(amp_test tests/optim/amp_test.cpp)
+target_link_libraries(amp_test PRIVATE neural_network GTest::gtest GTest::gtest_main)
+add_test(NAME AMPTest COMMAND amp_test)
+
+add_executable(lora_test tests/nn/lora_test.cpp)
+target_link_libraries(lora_test PRIVATE neural_network GTest::gtest GTest::gtest_main)
+add_test(NAME LoRATest COMMAND lora_test)

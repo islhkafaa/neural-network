@@ -24,12 +24,16 @@ public:
   [[nodiscard]] void *data() noexcept override;
   [[nodiscard]] const void *data() const noexcept override;
 
+  [[nodiscard]] DataType dtype() const noexcept override { return dtype_; }
+  void set_dtype(DataType dt) noexcept override { dtype_ = dt; }
+
 #ifdef WITH_DML
   ComPtr<ID3D12Resource> resource() const { return resource_; }
 #endif
 
 private:
   size_t size_;
+  DataType dtype_ = DataType::FP32;
 #ifdef WITH_DML
   ComPtr<ID3D12Resource> resource_;
 #endif

@@ -4,6 +4,7 @@
 #include "backend/backend.hpp"
 #include "backend/cpu_backend.hpp"
 #include "core/shape.hpp"
+#include "core/dtype.hpp"
 #include <functional>
 #include <memory>
 #include <vector>
@@ -15,12 +16,12 @@ inline ExecutionBackend *default_backend() {
 
 class Tensor : public std::enable_shared_from_this<Tensor> {
 public:
-  explicit Tensor(const Shape &shape, ExecutionBackend *backend = nullptr);
+  explicit Tensor(const Shape &shape, ExecutionBackend *backend = nullptr, DataType dtype = DataType::FP32);
   Tensor(const Shape &shape, const std::vector<float> &host_data,
-         ExecutionBackend *backend = nullptr);
+         ExecutionBackend *backend = nullptr, DataType dtype = DataType::FP32);
   Tensor(const Shape &shape, const Strides &strides, size_t offset,
          std::shared_ptr<DeviceBuffer> storage,
-         ExecutionBackend *backend = nullptr);
+         ExecutionBackend *backend = nullptr, DataType dtype = DataType::FP32);
 
   [[nodiscard]] const Shape &shape() const noexcept { return shape_; }
   [[nodiscard]] const Strides &strides() const noexcept { return strides_; }
@@ -29,6 +30,10 @@ public:
     return storage_;
   }
   [[nodiscard]] ExecutionBackend *backend() const noexcept { return backend_; }
+
+  [[nodiscard]] DataType dtype() const noexcept { return dtype_; }
+  void set_dtype(DataType dt) noexcept { dtype_ = dt; }
+  std::shared_ptr<Tensor> to(DataType target_dtype);
 
   [[nodiscard]] bool requires_grad() const noexcept { return requires_grad_; }
   void set_requires_grad(bool req) noexcept { requires_grad_ = req; }
@@ -83,6 +88,7 @@ private:
   size_t offset_ = 0;
   std::shared_ptr<DeviceBuffer> storage_;
   ExecutionBackend *backend_;
+  DataType dtype_ = DataType::FP32;
 
   bool requires_grad_ = false;
   std::shared_ptr<Tensor> grad_;
@@ -117,26 +123,26 @@ inline std::shared_ptr<Tensor> operator/(const std::shared_ptr<Tensor> &lhs,
 inline std::shared_ptr<Tensor> operator/(const std::shared_ptr<Tensor> &lhs,
                                          float rhs) {
   auto scalar = std::make_shared<Tensor>(Shape{}, std::vector<float>{rhs},
-                                         lhs->backend());
+                                         lhs->backend(), lhs->dtype());
   return lhs->div(scalar);
 }
 
 inline std::shared_ptr<Tensor> operator*(const std::shared_ptr<Tensor> &lhs,
                                          float rhs) {
   auto scalar = std::make_shared<Tensor>(Shape{}, std::vector<float>{rhs},
-                                         lhs->backend());
+                                         lhs->backend(), lhs->dtype());
   return lhs->mul(scalar);
 }
 
 inline std::shared_ptr<Tensor> operator*(float lhs,
                                          const std::shared_ptr<Tensor> &rhs) {
   auto scalar = std::make_shared<Tensor>(Shape{}, std::vector<float>{lhs},
-                                         rhs->backend());
+                                         rhs->backend(), rhs->dtype());
   return scalar->mul(rhs);
 }
 
 inline std::shared_ptr<Tensor> operator-(const std::shared_ptr<Tensor> &val) {
-  auto zero = std::make_shared<Tensor>(val->shape(), val->backend());
+  auto zero = std::make_shared<Tensor>(val->shape(), val->backend(), val->dtype());
   zero->fill(0.0f);
   return zero->sub(val);
 }

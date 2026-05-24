@@ -6,6 +6,8 @@
 #include <vector>
 
 class SwiGLU;
+struct LoRAConfig;
+class LoRALinear;
 
 class Layer {
 public:
@@ -213,18 +215,21 @@ public:
                      ExecutionBackend *backend = nullptr);
   std::shared_ptr<Tensor>
   forward(const std::shared_ptr<Tensor> &input) override;
-  std::shared_ptr<Tensor>
-  forward(const std::shared_ptr<Tensor> &input, KVCache *cache);
+  std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor> &input,
+                                  KVCache *cache);
   std::vector<std::shared_ptr<Tensor>> parameters() override;
+
+  void apply_lora(const LoRAConfig &cfg);
+  std::vector<std::shared_ptr<LoRALinear>> lora_modules() const;
 
 private:
   size_t num_heads_;
   size_t head_dim_;
   bool causal_;
-  std::shared_ptr<Dense> q_proj_;
-  std::shared_ptr<Dense> k_proj_;
-  std::shared_ptr<Dense> v_proj_;
-  std::shared_ptr<Dense> out_proj_;
+  std::shared_ptr<Layer> q_proj_;
+  std::shared_ptr<Layer> k_proj_;
+  std::shared_ptr<Layer> v_proj_;
+  std::shared_ptr<Layer> out_proj_;
 };
 
 class TransformerEncoderLayer : public Layer {
@@ -254,8 +259,8 @@ public:
                           ExecutionBackend *backend = nullptr);
   std::shared_ptr<Tensor>
   forward(const std::shared_ptr<Tensor> &input) override;
-  std::shared_ptr<Tensor>
-  forward(const std::shared_ptr<Tensor> &input, KVCache *cache);
+  std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor> &input,
+                                  KVCache *cache);
   std::vector<std::shared_ptr<Tensor>> parameters() override;
   void set_training(bool training) override;
 
@@ -275,8 +280,8 @@ public:
                      size_t max_seq_len, ExecutionBackend *backend = nullptr);
   std::shared_ptr<Tensor>
   forward(const std::shared_ptr<Tensor> &input) override;
-  std::shared_ptr<Tensor>
-  forward(const std::shared_ptr<Tensor> &input, std::vector<KVCache> *caches);
+  std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor> &input,
+                                  std::vector<KVCache> *caches);
   std::vector<std::shared_ptr<Tensor>> parameters() override;
   void set_training(bool training) override;
   std::vector<size_t> generate(const std::vector<size_t> &prompt,
@@ -284,8 +289,7 @@ public:
   std::vector<size_t> generate_advanced(const std::vector<size_t> &prompt,
                                         size_t max_new_tokens,
                                         float temperature = 1.0f,
-                                        size_t top_k = 0,
-                                        float top_p = 1.0f,
+                                        size_t top_k = 0, float top_p = 1.0f,
                                         unsigned int seed = 42,
                                         bool use_kv_cache = true);
 
@@ -314,9 +318,11 @@ private:
 class StochasticDepth : public Layer {
 public:
   explicit StochasticDepth(float drop_prob = 0.2f);
-  std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor> &input) override;
-  std::shared_ptr<Tensor> forward_residual(const std::shared_ptr<Tensor> &x,
-                                           const std::shared_ptr<Tensor> &sublayer_out);
+  std::shared_ptr<Tensor>
+  forward(const std::shared_ptr<Tensor> &input) override;
+  std::shared_ptr<Tensor>
+  forward_residual(const std::shared_ptr<Tensor> &x,
+                   const std::shared_ptr<Tensor> &sublayer_out);
 
 private:
   float drop_prob_;

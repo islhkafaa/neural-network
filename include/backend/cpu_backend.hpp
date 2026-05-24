@@ -3,6 +3,7 @@
 
 #include "backend/backend.hpp"
 #include <vector>
+#include <cstdint>
 
 class CpuBuffer : public DeviceBuffer {
 public:
@@ -12,11 +13,12 @@ public:
   [[nodiscard]] void *data() noexcept override;
   [[nodiscard]] const void *data() const noexcept override;
 
-  [[nodiscard]] std::vector<float> &vec() noexcept { return data_; }
-  [[nodiscard]] const std::vector<float> &vec() const noexcept { return data_; }
+  [[nodiscard]] DataType dtype() const noexcept override { return dtype_; }
+  void set_dtype(DataType dt) noexcept override { dtype_ = dt; }
 
 private:
-  std::vector<float> data_;
+  std::vector<uint8_t> data_;
+  DataType dtype_ = DataType::FP32;
 };
 
 class CpuBackend : public ExecutionBackend {

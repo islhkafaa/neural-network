@@ -1,6 +1,8 @@
 #include "nn/layer.hpp"
-#include "nn/initialization.hpp"
 #include "core/serialization.hpp"
+#include "nn/initialization.hpp"
+#include "nn/lora.hpp"
+#include "optim/grad_scaler.hpp"
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -17,6 +19,13 @@ Dense::Dense(size_t in_features, size_t out_features,
 }
 
 std::shared_ptr<Tensor> Dense::forward(const std::shared_ptr<Tensor> &input) {
+  if (AMPContext::is_enabled()) {
+    auto dt = AMPContext::active_dtype();
+    auto active_input = input->to(dt);
+    auto active_weight = weight_->to(dt);
+    auto active_bias = bias_->to(dt);
+    return active_input->matmul(active_weight)->add(active_bias);
+  }
   return input->matmul(weight_)->add(bias_);
 }
 
@@ -61,6 +70,34 @@ LayerNorm::LayerNorm(const Shape &normalized_shape, ExecutionBackend *backend,
 
 std::shared_ptr<Tensor>
 LayerNorm::forward(const std::shared_ptr<Tensor> &input) {
+  if (AMPContext::is_enabled()) {
+    auto dt = AMPContext::active_dtype();
+    auto active_input = input->to(dt);
+    auto active_gamma = gamma_->to(dt);
+    auto active_beta = beta_->to(dt);
+
+    std::vector<size_t> axes;
+    size_t start_axis = active_input->shape().size() - normalized_shape_.size();
+    for (size_t a = start_axis; a < active_input->shape().size(); ++a) {
+      axes.push_back(a);
+    }
+
+    float N = static_cast<float>(count_elements(normalized_shape_));
+    auto N_tensor = std::make_shared<Tensor>(Shape{}, std::vector<float>{N},
+                                             active_input->backend(), dt);
+    auto eps_tensor = std::make_shared<Tensor>(
+        Shape{}, std::vector<float>{eps_}, active_input->backend(), dt);
+
+    auto mean = active_input->sum(axes, true)->div(N_tensor);
+    auto diff = active_input->sub(mean);
+    auto sq_diff = diff->mul(diff);
+    auto var = sq_diff->sum(axes, true)->div(N_tensor);
+    auto stddev = var->add(eps_tensor)->sqrt();
+    auto x_hat = diff->div(stddev);
+
+    return x_hat->mul(active_gamma)->add(active_beta);
+  }
+
   std::vector<size_t> axes;
   size_t start_axis = input->shape().size() - normalized_shape_.size();
   for (size_t a = start_axis; a < input->shape().size(); ++a) {
@@ -315,6 +352,47 @@ std::vector<std::shared_ptr<Tensor>> MultiHeadAttention::parameters() {
   return params;
 }
 
+void MultiHeadAttention::apply_lora(const LoRAConfig &cfg) {
+  if (cfg.target_modules.count("q_proj")) {
+    if (auto d = std::dynamic_pointer_cast<Dense>(q_proj_)) {
+      q_proj_ = std::make_shared<LoRALinear>(d, cfg);
+    }
+  }
+  if (cfg.target_modules.count("k_proj")) {
+    if (auto d = std::dynamic_pointer_cast<Dense>(k_proj_)) {
+      k_proj_ = std::make_shared<LoRALinear>(d, cfg);
+    }
+  }
+  if (cfg.target_modules.count("v_proj")) {
+    if (auto d = std::dynamic_pointer_cast<Dense>(v_proj_)) {
+      v_proj_ = std::make_shared<LoRALinear>(d, cfg);
+    }
+  }
+  if (cfg.target_modules.count("out_proj")) {
+    if (auto d = std::dynamic_pointer_cast<Dense>(out_proj_)) {
+      out_proj_ = std::make_shared<LoRALinear>(d, cfg);
+    }
+  }
+}
+
+std::vector<std::shared_ptr<LoRALinear>>
+MultiHeadAttention::lora_modules() const {
+  std::vector<std::shared_ptr<LoRALinear>> modules;
+  if (auto l = std::dynamic_pointer_cast<LoRALinear>(q_proj_)) {
+    modules.push_back(l);
+  }
+  if (auto l = std::dynamic_pointer_cast<LoRALinear>(k_proj_)) {
+    modules.push_back(l);
+  }
+  if (auto l = std::dynamic_pointer_cast<LoRALinear>(v_proj_)) {
+    modules.push_back(l);
+  }
+  if (auto l = std::dynamic_pointer_cast<LoRALinear>(out_proj_)) {
+    modules.push_back(l);
+  }
+  return modules;
+}
+
 std::shared_ptr<Tensor>
 MultiHeadAttention::forward(const std::shared_ptr<Tensor> &input) {
   return forward(input, nullptr);
@@ -430,7 +508,9 @@ MultiHeadAttention::forward(const std::shared_ptr<Tensor> &input,
           for (size_t j = S_past + i + 1; j < S_total; ++j) {
             size_t idx =
                 b * (H * S * S_total) + h * (S * S_total) + i * S_total + j;
-            host_data[idx] = -1e9f;
+            float mask_val =
+                (scaled_scores->dtype() == DataType::FP16) ? -65000.0f : -1e9f;
+            host_data[idx] = mask_val;
           }
         }
       }

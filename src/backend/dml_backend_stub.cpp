@@ -16,7 +16,7 @@ DmlBackend::DmlBackend() {
 
 DmlBackend::~DmlBackend() {}
 
-std::unique_ptr<DeviceBuffer> DmlBackend::allocate(size_t bytes) {
+std::unique_ptr<DeviceBuffer> DmlBackend::allocate(size_t) {
   throw std::runtime_error("DirectML is not enabled in this build.");
 }
 
