@@ -1,5 +1,5 @@
-#include "nn/layer.hpp"
 #include "core/tensor.hpp"
+#include "nn/layer.hpp"
 #include <gtest/gtest.h>
 #include <memory>
 #include <vector>
@@ -261,8 +261,10 @@ TEST(TransformerTest, KVCachingCorrectness) {
   std::vector<size_t> prompt = {1, 2, 3};
   size_t max_new_tokens = 4;
 
-  auto gen_no_cache = model.generate_advanced(prompt, max_new_tokens, 0.0f, 0, 1.0f, 42, false);
-  auto gen_with_cache = model.generate_advanced(prompt, max_new_tokens, 0.0f, 0, 1.0f, 42, true);
+  auto gen_no_cache =
+      model.generate_advanced(prompt, max_new_tokens, 0.0f, 0, 1.0f, 42, false);
+  auto gen_with_cache =
+      model.generate_advanced(prompt, max_new_tokens, 0.0f, 0, 1.0f, 42, true);
 
   EXPECT_EQ(gen_no_cache.size(), gen_with_cache.size());
   for (size_t i = 0; i < gen_no_cache.size(); ++i) {
@@ -284,17 +286,86 @@ TEST(TransformerTest, AdvancedSamplerValidation) {
   std::vector<size_t> prompt = {1, 2, 3};
   size_t max_new_tokens = 5;
 
-  auto gen_seed42_a = model.generate_advanced(prompt, max_new_tokens, 1.0f, 3, 0.9f, 42, true);
-  auto gen_seed42_b = model.generate_advanced(prompt, max_new_tokens, 1.0f, 3, 0.9f, 42, true);
+  auto gen_seed42_a =
+      model.generate_advanced(prompt, max_new_tokens, 1.0f, 3, 0.9f, 42, true);
+  auto gen_seed42_b =
+      model.generate_advanced(prompt, max_new_tokens, 1.0f, 3, 0.9f, 42, true);
 
   for (size_t i = 0; i < gen_seed42_a.size(); ++i) {
     EXPECT_EQ(gen_seed42_a[i], gen_seed42_b[i]);
   }
 
-  auto gen_seed99 = model.generate_advanced(prompt, max_new_tokens, 1.0f, 3, 0.9f, 99, true);
+  auto gen_seed99 =
+      model.generate_advanced(prompt, max_new_tokens, 1.0f, 3, 0.9f, 99, true);
 
   EXPECT_EQ(gen_seed99.size(), gen_seed42_a.size());
   for (size_t tok : gen_seed99) {
+    EXPECT_LT(tok, vocab_size);
+  }
+}
+
+TEST(TransformerTest, SpeculativeDecodingParity) {
+  size_t vocab_size = 8;
+  size_t embed_dim = 8;
+  size_t num_heads = 2;
+  size_t dim_feedforward = 16;
+  size_t max_seq_len = 32;
+
+  TransformerDecoder target_model(vocab_size, embed_dim, num_heads,
+                                  dim_feedforward, 2, max_seq_len);
+  TransformerDecoder draft_model(vocab_size, embed_dim, num_heads,
+                                 dim_feedforward, 1, max_seq_len);
+
+  // Initialize weights so they don't produce NaNs
+  // Let's run a simple forward/generation to verify they work
+  std::vector<size_t> prompt = {1, 2, 3};
+  size_t max_new_tokens = 6;
+
+  // Greedy Mode Parity (temperature = 0.0f)
+  // Speculative decoding MUST yield identical output to standard autoregressive
+  // decoding
+  auto gen_ar = target_model.generate_advanced(prompt, max_new_tokens, 0.0f, 0,
+                                               1.0f, 42, true);
+  auto gen_spec = target_model.generate_speculative(
+      &draft_model, prompt, max_new_tokens, 3, 0.0f, 0, 1.0f, 42, false);
+
+  ASSERT_EQ(gen_ar.size(), gen_spec.size());
+  for (size_t i = 0; i < gen_ar.size(); ++i) {
+    EXPECT_EQ(gen_ar[i], gen_spec[i]);
+  }
+
+  // Stochastic Mode Verification (temperature = 1.0f)
+  // Ensure that the speculative generation runs successfully and produces valid
+  // tokens
+  auto gen_spec_stochastic = target_model.generate_speculative(
+      &draft_model, prompt, max_new_tokens, 3, 1.0f, 4, 0.9f, 42, false);
+  EXPECT_EQ(gen_spec_stochastic.size(), prompt.size() + max_new_tokens);
+  for (size_t tok : gen_spec_stochastic) {
+    EXPECT_LT(tok, vocab_size);
+  }
+}
+
+TEST(TransformerTest, SpeculativeDecodingQuantized) {
+  size_t vocab_size = 6;
+  size_t embed_dim = 8;
+  size_t num_heads = 2;
+  size_t dim_feedforward = 16;
+  size_t max_seq_len = 32;
+
+  TransformerDecoder target_model(vocab_size, embed_dim, num_heads,
+                                  dim_feedforward, 2, max_seq_len);
+  TransformerDecoder draft_model(vocab_size, embed_dim, num_heads,
+                                 dim_feedforward, 1, max_seq_len);
+
+  std::vector<size_t> prompt = {2, 4, 1};
+  size_t max_new_tokens = 5;
+
+  // Run speculative decoding with quantized KV cache
+  auto gen_spec_quant = target_model.generate_speculative(
+      &draft_model, prompt, max_new_tokens, 2, 0.0f, 0, 1.0f, 42, true);
+
+  EXPECT_EQ(gen_spec_quant.size(), prompt.size() + max_new_tokens);
+  for (size_t tok : gen_spec_quant) {
     EXPECT_LT(tok, vocab_size);
   }
 }

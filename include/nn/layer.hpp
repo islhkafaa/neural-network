@@ -2,12 +2,14 @@
 #define LAYER_HPP
 
 #include "core/tensor.hpp"
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 class SwiGLU;
 struct LoRAConfig;
 class LoRALinear;
+struct QuantizationConfig;
 
 class Layer {
 public:
@@ -200,6 +202,9 @@ public:
   void set_training(bool training) override;
   std::vector<std::shared_ptr<Tensor>> parameters() override;
 
+  std::vector<std::shared_ptr<Layer>> &layers() { return layers_; }
+  const std::vector<std::shared_ptr<Layer>> &layers() const { return layers_; }
+
 private:
   std::vector<std::shared_ptr<Layer>> layers_;
 };
@@ -207,12 +212,28 @@ private:
 struct KVCache {
   std::shared_ptr<Tensor> k;
   std::shared_ptr<Tensor> v;
+
+  bool quantized = false;
+  std::vector<int8_t> quantized_k;
+  std::vector<int8_t> quantized_v;
+  std::vector<float> k_scales;
+  std::vector<float> v_scales;
+  Shape shape;
+
+  explicit KVCache(bool quantized = false) : quantized(quantized) {}
+
+  std::shared_ptr<Tensor> dequantize_k(ExecutionBackend *backend,
+                                       DataType dtype) const;
+  std::shared_ptr<Tensor> dequantize_v(ExecutionBackend *backend,
+                                       DataType dtype) const;
+  void truncate(size_t len);
 };
 
 class MultiHeadAttention : public Layer {
 public:
   MultiHeadAttention(size_t embed_dim, size_t num_heads, bool causal = false,
-                     ExecutionBackend *backend = nullptr);
+                     ExecutionBackend *backend = nullptr,
+                     size_t num_kv_heads = 0);
   std::shared_ptr<Tensor>
   forward(const std::shared_ptr<Tensor> &input) override;
   std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor> &input,
@@ -221,9 +242,11 @@ public:
 
   void apply_lora(const LoRAConfig &cfg);
   std::vector<std::shared_ptr<LoRALinear>> lora_modules() const;
+  void quantize(const QuantizationConfig &cfg);
 
 private:
   size_t num_heads_;
+  size_t num_kv_heads_;
   size_t head_dim_;
   bool causal_;
   std::shared_ptr<Layer> q_proj_;
@@ -292,6 +315,12 @@ public:
                                         size_t top_k = 0, float top_p = 1.0f,
                                         unsigned int seed = 42,
                                         bool use_kv_cache = true);
+  std::vector<size_t>
+  generate_speculative(TransformerDecoder *draft_model,
+                       const std::vector<size_t> &prompt, size_t max_new_tokens,
+                       size_t lookahead = 4, float temperature = 1.0f,
+                       size_t top_k = 0, float top_p = 1.0f,
+                       unsigned int seed = 42, bool quantized_cache = false);
 
 private:
   size_t max_seq_len_;

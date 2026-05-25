@@ -1,11 +1,152 @@
 #include "nn/layer.hpp"
+#include "backend/thread_pool.hpp"
 #include "core/serialization.hpp"
 #include "nn/initialization.hpp"
 #include "nn/lora.hpp"
+#include "nn/quantization.hpp"
 #include "optim/grad_scaler.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <random>
+
+std::shared_ptr<Tensor> KVCache::dequantize_k(ExecutionBackend *backend,
+                                              DataType dtype) const {
+  if (!quantized) {
+    return k;
+  }
+  size_t size = quantized_k.size();
+  std::vector<float> host_data(size);
+  size_t D = shape[3];
+  size_t S_total = shape[2];
+  size_t H_kv = shape[1];
+  size_t B = shape[0];
+
+  for (size_t b = 0; b < B; ++b) {
+    for (size_t h = 0; h < H_kv; ++h) {
+      for (size_t j = 0; j < S_total; ++j) {
+        size_t scale_idx = b * (H_kv * S_total) + h * S_total + j;
+        float scale = k_scales[scale_idx];
+        for (size_t d = 0; d < D; ++d) {
+          size_t idx = b * (H_kv * S_total * D) + h * (S_total * D) + j * D + d;
+          host_data[idx] = static_cast<float>(quantized_k[idx]) * scale;
+        }
+      }
+    }
+  }
+  return std::make_shared<Tensor>(shape, host_data, backend, dtype);
+}
+
+std::shared_ptr<Tensor> KVCache::dequantize_v(ExecutionBackend *backend,
+                                              DataType dtype) const {
+  if (!quantized) {
+    return v;
+  }
+  size_t size = quantized_v.size();
+  std::vector<float> host_data(size);
+  size_t D = shape[3];
+  size_t S_total = shape[2];
+  size_t H_kv = shape[1];
+  size_t B = shape[0];
+
+  for (size_t b = 0; b < B; ++b) {
+    for (size_t h = 0; h < H_kv; ++h) {
+      for (size_t j = 0; j < S_total; ++j) {
+        size_t scale_idx = b * (H_kv * S_total) + h * S_total + j;
+        float scale = v_scales[scale_idx];
+        for (size_t d = 0; d < D; ++d) {
+          size_t idx = b * (H_kv * S_total * D) + h * (S_total * D) + j * D + d;
+          host_data[idx] = static_cast<float>(quantized_v[idx]) * scale;
+        }
+      }
+    }
+  }
+  return std::make_shared<Tensor>(shape, host_data, backend, dtype);
+}
+
+void KVCache::truncate(size_t len) {
+  if (quantized) {
+    if (quantized_k.empty()) {
+      return;
+    }
+    size_t B = shape[0];
+    size_t H_kv = shape[1];
+    size_t S_past = shape[2];
+    size_t D = shape[3];
+
+    if (len >= S_past) {
+      return;
+    }
+
+    std::vector<int8_t> concat_k(B * H_kv * len * D);
+    std::vector<int8_t> concat_v(B * H_kv * len * D);
+    std::vector<float> concat_k_scales(B * H_kv * len);
+    std::vector<float> concat_v_scales(B * H_kv * len);
+
+    for (size_t b = 0; b < B; ++b) {
+      for (size_t h = 0; h < H_kv; ++h) {
+        std::copy(quantized_k.begin() +
+                      (b * H_kv * S_past * D + h * S_past * D),
+                  quantized_k.begin() +
+                      (b * H_kv * S_past * D + h * S_past * D + len * D),
+                  concat_k.begin() + (b * H_kv * len * D + h * len * D));
+        std::copy(quantized_v.begin() +
+                      (b * H_kv * S_past * D + h * S_past * D),
+                  quantized_v.begin() +
+                      (b * H_kv * S_past * D + h * S_past * D + len * D),
+                  concat_v.begin() + (b * H_kv * len * D + h * len * D));
+        std::copy(k_scales.begin() + (b * H_kv * S_past + h * S_past),
+                  k_scales.begin() + (b * H_kv * S_past + h * S_past + len),
+                  concat_k_scales.begin() + (b * H_kv * len + h * len));
+        std::copy(v_scales.begin() + (b * H_kv * S_past + h * S_past),
+                  v_scales.begin() + (b * H_kv * S_past + h * S_past + len),
+                  concat_v_scales.begin() + (b * H_kv * len + h * len));
+      }
+    }
+
+    quantized_k = std::move(concat_k);
+    quantized_v = std::move(concat_v);
+    k_scales = std::move(concat_k_scales);
+    v_scales = std::move(concat_v_scales);
+    shape = Shape{B, H_kv, len, D};
+  } else {
+    if (!k) {
+      return;
+    }
+    size_t B = k->shape()[0];
+    size_t H_kv = k->shape()[1];
+    size_t S_past = k->shape()[2];
+    size_t D = k->shape()[3];
+
+    if (len >= S_past) {
+      return;
+    }
+
+    std::vector<float> past_k = k->to_host();
+    std::vector<float> past_v = v->to_host();
+
+    std::vector<float> concat_k(B * H_kv * len * D);
+    std::vector<float> concat_v(B * H_kv * len * D);
+
+    for (size_t b = 0; b < B; ++b) {
+      for (size_t h = 0; h < H_kv; ++h) {
+        std::copy(past_k.begin() + (b * H_kv * S_past * D + h * S_past * D),
+                  past_k.begin() +
+                      (b * H_kv * S_past * D + h * S_past * D + len * D),
+                  concat_k.begin() + (b * H_kv * len * D + h * len * D));
+        std::copy(past_v.begin() + (b * H_kv * S_past * D + h * S_past * D),
+                  past_v.begin() +
+                      (b * H_kv * S_past * D + h * S_past * D + len * D),
+                  concat_v.begin() + (b * H_kv * len * D + h * len * D));
+      }
+    }
+
+    k = std::make_shared<Tensor>(Shape{B, H_kv, len, D}, concat_k, k->backend(),
+                                 k->dtype());
+    v = std::make_shared<Tensor>(Shape{B, H_kv, len, D}, concat_v, v->backend(),
+                                 v->dtype());
+  }
+}
 
 Dense::Dense(size_t in_features, size_t out_features,
              ExecutionBackend *backend) {
@@ -328,14 +469,22 @@ void Layer::load_weights(const std::string &filepath) {
 }
 
 MultiHeadAttention::MultiHeadAttention(size_t embed_dim, size_t num_heads,
-                                       bool causal, ExecutionBackend *backend)
-    : num_heads_(num_heads), head_dim_(embed_dim / num_heads), causal_(causal) {
+                                       bool causal, ExecutionBackend *backend,
+                                       size_t num_kv_heads)
+    : num_heads_(num_heads),
+      num_kv_heads_(num_kv_heads == 0 ? num_heads : num_kv_heads),
+      head_dim_(embed_dim / num_heads), causal_(causal) {
   if (embed_dim % num_heads != 0) {
     throw std::runtime_error("embed_dim must be divisible by num_heads");
   }
+  if (num_heads_ % num_kv_heads_ != 0) {
+    throw std::runtime_error("num_heads must be divisible by num_kv_heads");
+  }
   q_proj_ = std::make_shared<Dense>(embed_dim, embed_dim, backend);
-  k_proj_ = std::make_shared<Dense>(embed_dim, embed_dim, backend);
-  v_proj_ = std::make_shared<Dense>(embed_dim, embed_dim, backend);
+  k_proj_ =
+      std::make_shared<Dense>(embed_dim, num_kv_heads_ * head_dim_, backend);
+  v_proj_ =
+      std::make_shared<Dense>(embed_dim, num_kv_heads_ * head_dim_, backend);
   out_proj_ = std::make_shared<Dense>(embed_dim, embed_dim, backend);
 }
 
@@ -393,9 +542,52 @@ MultiHeadAttention::lora_modules() const {
   return modules;
 }
 
+void MultiHeadAttention::quantize(const QuantizationConfig &cfg) {
+  if (auto d = std::dynamic_pointer_cast<Dense>(q_proj_)) {
+    q_proj_ = std::make_shared<QuantizedDense>(d, cfg);
+  }
+  if (auto d = std::dynamic_pointer_cast<Dense>(k_proj_)) {
+    k_proj_ = std::make_shared<QuantizedDense>(d, cfg);
+  }
+  if (auto d = std::dynamic_pointer_cast<Dense>(v_proj_)) {
+    v_proj_ = std::make_shared<QuantizedDense>(d, cfg);
+  }
+  if (auto d = std::dynamic_pointer_cast<Dense>(out_proj_)) {
+    out_proj_ = std::make_shared<QuantizedDense>(d, cfg);
+  }
+}
+
 std::shared_ptr<Tensor>
 MultiHeadAttention::forward(const std::shared_ptr<Tensor> &input) {
   return forward(input, nullptr);
+}
+
+static std::shared_ptr<Tensor> expand_heads(const std::shared_ptr<Tensor> &src,
+                                            size_t num_heads,
+                                            size_t num_kv_heads) {
+  if (num_heads == num_kv_heads) {
+    return src;
+  }
+  size_t B = src->shape()[0];
+  size_t S = src->shape()[2];
+  size_t D = src->shape()[3];
+  size_t group_size = num_heads / num_kv_heads;
+
+  std::vector<float> src_data = src->to_host();
+  std::vector<float> dst_data(B * num_heads * S * D);
+
+  for (size_t b = 0; b < B; ++b) {
+    for (size_t h_q = 0; h_q < num_heads; ++h_q) {
+      size_t h_kv = h_q / group_size;
+      std::copy(src_data.begin() + (b * num_kv_heads * S * D + h_kv * S * D),
+                src_data.begin() +
+                    (b * num_kv_heads * S * D + h_kv * S * D + S * D),
+                dst_data.begin() + (b * num_heads * S * D + h_q * S * D));
+    }
+  }
+
+  return std::make_shared<Tensor>(Shape{B, num_heads, S, D}, dst_data,
+                                  src->backend());
 }
 
 std::shared_ptr<Tensor>
@@ -416,16 +608,22 @@ MultiHeadAttention::forward(const std::shared_ptr<Tensor> &input,
   auto v_flat = v_proj_->forward(x_flat);
 
   auto q = q_flat->reshape(Shape{B, S, num_heads_, head_dim_});
-  auto k = k_flat->reshape(Shape{B, S, num_heads_, head_dim_});
-  auto v = v_flat->reshape(Shape{B, S, num_heads_, head_dim_});
+  auto k = k_flat->reshape(Shape{B, S, num_kv_heads_, head_dim_});
+  auto v = v_flat->reshape(Shape{B, S, num_kv_heads_, head_dim_});
 
   auto q_t = q->transpose(1, 2);
   auto k_t = k->transpose(1, 2);
   auto v_t = v->transpose(1, 2);
 
   size_t S_past = 0;
-  if (cache && cache->k) {
-    S_past = cache->k->shape()[2];
+  if (cache) {
+    if (cache->quantized) {
+      if (!cache->quantized_k.empty()) {
+        S_past = cache->shape[2];
+      }
+    } else if (cache->k) {
+      S_past = cache->k->shape()[2];
+    }
   }
 
   q_t = q_t->rope(S_past);
@@ -434,95 +632,362 @@ MultiHeadAttention::forward(const std::shared_ptr<Tensor> &input,
   std::shared_ptr<Tensor> active_k;
   std::shared_ptr<Tensor> active_v;
 
-  if (cache) {
-    if (!cache->k) {
-      cache->k = k_t;
-      cache->v = v_t;
-    } else {
-      size_t S_past = cache->k->shape()[2];
-      size_t S_total = S_past + S;
-      size_t D = head_dim_;
-
-      std::vector<float> past_k = cache->k->to_host();
-      std::vector<float> new_k = k_t->to_host();
-      std::vector<float> concat_k(B * num_heads_ * S_total * D);
-
-      std::vector<float> past_v = cache->v->to_host();
-      std::vector<float> new_v = v_t->to_host();
-      std::vector<float> concat_v(B * num_heads_ * S_total * D);
-
-      for (size_t b = 0; b < B; ++b) {
-        for (size_t h = 0; h < num_heads_; ++h) {
-          std::copy(
-              past_k.begin() + (b * num_heads_ * S_past * D + h * S_past * D),
-              past_k.begin() +
-                  (b * num_heads_ * S_past * D + h * S_past * D + S_past * D),
-              concat_k.begin() +
-                  (b * num_heads_ * S_total * D + h * S_total * D));
-          std::copy(new_k.begin() + (b * num_heads_ * S * D + h * S * D),
-                    new_k.begin() +
-                        (b * num_heads_ * S * D + h * S * D + S * D),
-                    concat_k.begin() + (b * num_heads_ * S_total * D +
-                                        h * S_total * D + S_past * D));
-
-          std::copy(
-              past_v.begin() + (b * num_heads_ * S_past * D + h * S_past * D),
-              past_v.begin() +
-                  (b * num_heads_ * S_past * D + h * S_past * D + S_past * D),
-              concat_v.begin() +
-                  (b * num_heads_ * S_total * D + h * S_total * D));
-          std::copy(new_v.begin() + (b * num_heads_ * S * D + h * S * D),
-                    new_v.begin() +
-                        (b * num_heads_ * S * D + h * S * D + S * D),
-                    concat_v.begin() + (b * num_heads_ * S_total * D +
-                                        h * S_total * D + S_past * D));
+  auto quantize_kv = [](const std::vector<float> &src, size_t B, size_t H_kv,
+                        size_t S, size_t D, std::vector<int8_t> &dst_q,
+                        std::vector<float> &dst_scales) {
+    dst_q.resize(B * H_kv * S * D);
+    dst_scales.resize(B * H_kv * S);
+    for (size_t b = 0; b < B; ++b) {
+      for (size_t h = 0; h < H_kv; ++h) {
+        for (size_t s = 0; s < S; ++s) {
+          size_t base_idx = b * (H_kv * S * D) + h * (S * D) + s * D;
+          float max_val = 0.0f;
+          for (size_t d = 0; d < D; ++d) {
+            float val = std::abs(src[base_idx + d]);
+            if (val > max_val) {
+              max_val = val;
+            }
+          }
+          float scale = max_val / 127.0f;
+          if (scale == 0.0f) {
+            scale = 1.0f;
+          }
+          dst_scales[b * (H_kv * S) + h * S + s] = scale;
+          float inv_scale = 1.0f / scale;
+          for (size_t d = 0; d < D; ++d) {
+            float q_val = std::round(src[base_idx + d] * inv_scale);
+            q_val = std::max(-127.0f, std::min(127.0f, q_val));
+            dst_q[base_idx + d] = static_cast<int8_t>(q_val);
+          }
         }
       }
-
-      cache->k = std::make_shared<Tensor>(Shape{B, num_heads_, S_total, D},
-                                          concat_k, input->backend());
-      cache->v = std::make_shared<Tensor>(Shape{B, num_heads_, S_total, D},
-                                          concat_v, input->backend());
     }
-    active_k = cache->k;
-    active_v = cache->v;
+  };
+
+  if (cache) {
+    if (cache->quantized) {
+      size_t D = head_dim_;
+      if (cache->quantized_k.empty()) {
+        std::vector<float> host_k = k_t->to_host();
+        std::vector<float> host_v = v_t->to_host();
+        quantize_kv(host_k, B, num_kv_heads_, S, D, cache->quantized_k,
+                    cache->k_scales);
+        quantize_kv(host_v, B, num_kv_heads_, S, D, cache->quantized_v,
+                    cache->v_scales);
+        cache->shape = Shape{B, num_kv_heads_, S, D};
+      } else {
+        size_t S_past = cache->shape[2];
+        size_t S_total = S_past + S;
+
+        std::vector<float> host_new_k = k_t->to_host();
+        std::vector<float> host_new_v = v_t->to_host();
+
+        std::vector<int8_t> new_q_k;
+        std::vector<float> new_k_scales;
+        quantize_kv(host_new_k, B, num_kv_heads_, S, D, new_q_k, new_k_scales);
+
+        std::vector<int8_t> new_q_v;
+        std::vector<float> new_v_scales;
+        quantize_kv(host_new_v, B, num_kv_heads_, S, D, new_q_v, new_v_scales);
+
+        std::vector<int8_t> concat_k(B * num_kv_heads_ * S_total * D);
+        std::vector<int8_t> concat_v(B * num_kv_heads_ * S_total * D);
+        std::vector<float> concat_k_scales(B * num_kv_heads_ * S_total);
+        std::vector<float> concat_v_scales(B * num_kv_heads_ * S_total);
+
+        for (size_t b = 0; b < B; ++b) {
+          for (size_t h = 0; h < num_kv_heads_; ++h) {
+            std::copy(cache->quantized_k.begin() +
+                          (b * num_kv_heads_ * S_past * D + h * S_past * D),
+                      cache->quantized_k.begin() +
+                          (b * num_kv_heads_ * S_past * D + h * S_past * D +
+                           S_past * D),
+                      concat_k.begin() +
+                          (b * num_kv_heads_ * S_total * D + h * S_total * D));
+            std::copy(cache->quantized_v.begin() +
+                          (b * num_kv_heads_ * S_past * D + h * S_past * D),
+                      cache->quantized_v.begin() +
+                          (b * num_kv_heads_ * S_past * D + h * S_past * D +
+                           S_past * D),
+                      concat_v.begin() +
+                          (b * num_kv_heads_ * S_total * D + h * S_total * D));
+
+            std::copy(new_q_k.begin() + (b * num_kv_heads_ * S * D + h * S * D),
+                      new_q_k.begin() +
+                          (b * num_kv_heads_ * S * D + h * S * D + S * D),
+                      concat_k.begin() + (b * num_kv_heads_ * S_total * D +
+                                          h * S_total * D + S_past * D));
+            std::copy(new_q_v.begin() + (b * num_kv_heads_ * S * D + h * S * D),
+                      new_q_v.begin() +
+                          (b * num_kv_heads_ * S * D + h * S * D + S * D),
+                      concat_v.begin() + (b * num_kv_heads_ * S_total * D +
+                                          h * S_total * D + S_past * D));
+
+            std::copy(cache->k_scales.begin() +
+                          (b * num_kv_heads_ * S_past + h * S_past),
+                      cache->k_scales.begin() +
+                          (b * num_kv_heads_ * S_past + h * S_past + S_past),
+                      concat_k_scales.begin() +
+                          (b * num_kv_heads_ * S_total + h * S_total));
+            std::copy(cache->v_scales.begin() +
+                          (b * num_kv_heads_ * S_past + h * S_past),
+                      cache->v_scales.begin() +
+                          (b * num_kv_heads_ * S_past + h * S_past + S_past),
+                      concat_v_scales.begin() +
+                          (b * num_kv_heads_ * S_total + h * S_total));
+
+            std::copy(new_k_scales.begin() + (b * num_kv_heads_ * S + h * S),
+                      new_k_scales.begin() +
+                          (b * num_kv_heads_ * S + h * S + S),
+                      concat_k_scales.begin() +
+                          (b * num_kv_heads_ * S_total + h * S_total + S_past));
+            std::copy(new_v_scales.begin() + (b * num_kv_heads_ * S + h * S),
+                      new_v_scales.begin() +
+                          (b * num_kv_heads_ * S + h * S + S),
+                      concat_v_scales.begin() +
+                          (b * num_kv_heads_ * S_total + h * S_total + S_past));
+          }
+        }
+
+        cache->quantized_k = std::move(concat_k);
+        cache->quantized_v = std::move(concat_v);
+        cache->k_scales = std::move(concat_k_scales);
+        cache->v_scales = std::move(concat_v_scales);
+        cache->shape = Shape{B, num_kv_heads_, S_total, D};
+      }
+    } else {
+      if (!cache->k) {
+        cache->k = k_t;
+        cache->v = v_t;
+      } else {
+        size_t S_past = cache->k->shape()[2];
+        size_t S_total = S_past + S;
+        size_t D = head_dim_;
+
+        std::vector<float> past_k = cache->k->to_host();
+        std::vector<float> new_k = k_t->to_host();
+        std::vector<float> concat_k(B * num_kv_heads_ * S_total * D);
+
+        std::vector<float> past_v = cache->v->to_host();
+        std::vector<float> new_v = v_t->to_host();
+        std::vector<float> concat_v(B * num_kv_heads_ * S_total * D);
+
+        for (size_t b = 0; b < B; ++b) {
+          for (size_t h = 0; h < num_kv_heads_; ++h) {
+            std::copy(past_k.begin() +
+                          (b * num_kv_heads_ * S_past * D + h * S_past * D),
+                      past_k.begin() + (b * num_kv_heads_ * S_past * D +
+                                        h * S_past * D + S_past * D),
+                      concat_k.begin() +
+                          (b * num_kv_heads_ * S_total * D + h * S_total * D));
+            std::copy(new_k.begin() + (b * num_kv_heads_ * S * D + h * S * D),
+                      new_k.begin() +
+                          (b * num_kv_heads_ * S * D + h * S * D + S * D),
+                      concat_k.begin() + (b * num_kv_heads_ * S_total * D +
+                                          h * S_total * D + S_past * D));
+
+            std::copy(past_v.begin() +
+                          (b * num_kv_heads_ * S_past * D + h * S_past * D),
+                      past_v.begin() + (b * num_kv_heads_ * S_past * D +
+                                        h * S_past * D + S_past * D),
+                      concat_v.begin() +
+                          (b * num_kv_heads_ * S_total * D + h * S_total * D));
+            std::copy(new_v.begin() + (b * num_kv_heads_ * S * D + h * S * D),
+                      new_v.begin() +
+                          (b * num_kv_heads_ * S * D + h * S * D + S * D),
+                      concat_v.begin() + (b * num_kv_heads_ * S_total * D +
+                                          h * S_total * D + S_past * D));
+          }
+        }
+
+        cache->k = std::make_shared<Tensor>(Shape{B, num_kv_heads_, S_total, D},
+                                            concat_k, input->backend());
+        cache->v = std::make_shared<Tensor>(Shape{B, num_kv_heads_, S_total, D},
+                                            concat_v, input->backend());
+      }
+    }
+  }
+
+  bool use_fused = !q_t->requires_grad();
+  if (cache) {
+    if (cache->quantized) {
+    } else {
+      if (cache->k->requires_grad() || cache->v->requires_grad()) {
+        use_fused = false;
+      }
+    }
+  } else {
+    if (k_t->requires_grad() || v_t->requires_grad()) {
+      use_fused = false;
+    }
+  }
+
+  if (cache) {
+    if (cache->quantized) {
+      if (!use_fused) {
+        active_k = cache->dequantize_k(input->backend(), input->dtype());
+        active_v = cache->dequantize_v(input->backend(), input->dtype());
+      }
+    } else {
+      active_k = cache->k;
+      active_v = cache->v;
+    }
   } else {
     active_k = k_t;
     active_v = v_t;
   }
 
-  auto k_trans = active_k->transpose(2, 3);
-  auto scores = q_t->bmm(k_trans);
+  std::shared_ptr<Tensor> context_flat;
 
-  float scale = std::sqrt(static_cast<float>(head_dim_));
-  auto scaled_scores = scores / scale;
-
-  if (causal_) {
-    size_t S_total = active_k->shape()[2];
-    size_t S_past = S_total - S;
-    auto host_data = scaled_scores->to_host();
+  if (use_fused) {
+    size_t S_total =
+        (cache && cache->quantized) ? cache->shape[2] : active_k->shape()[2];
+    size_t D = head_dim_;
     size_t H = num_heads_;
-    for (size_t b = 0; b < B; ++b) {
-      for (size_t h = 0; h < H; ++h) {
-        for (size_t i = 0; i < S; ++i) {
-          for (size_t j = S_past + i + 1; j < S_total; ++j) {
-            size_t idx =
-                b * (H * S * S_total) + h * (S * S_total) + i * S_total + j;
-            float mask_val =
-                (scaled_scores->dtype() == DataType::FP16) ? -65000.0f : -1e9f;
-            host_data[idx] = mask_val;
+    size_t H_kv = num_kv_heads_;
+    size_t group_size = H / H_kv;
+
+    std::vector<float> q_data = q_t->to_host();
+    std::vector<float> k_data;
+    std::vector<float> v_data;
+    if (!cache || !cache->quantized) {
+      k_data = active_k->to_host();
+      v_data = active_v->to_host();
+    }
+    std::vector<float> out_data(B * S * H * D, 0.0f);
+
+    ThreadPool::instance().parallel_for(
+        0, B * H, [&](size_t start, size_t end) {
+          for (size_t bh = start; bh < end; ++bh) {
+            size_t b = bh / H;
+            size_t h = bh % H;
+            size_t h_kv = h / group_size;
+
+            std::vector<float> row_scores(S_total);
+            float scale = std::sqrt(static_cast<float>(D));
+
+            for (size_t i = 0; i < S; ++i) {
+              float max_score = -std::numeric_limits<float>::infinity();
+
+              for (size_t j = 0; j < S_total; ++j) {
+                if (causal_ && j > S_past + i) {
+                  row_scores[j] =
+                      (q_t->dtype() == DataType::FP16) ? -65000.0f : -1e9f;
+                  continue;
+                }
+
+                float dot = 0.0f;
+                size_t q_base = b * (H * S * D) + h * (S * D) + i * D;
+                if (cache && cache->quantized) {
+                  size_t k_base =
+                      b * (H_kv * S_total * D) + h_kv * (S_total * D) + j * D;
+                  size_t scale_idx = b * (H_kv * S_total) + h_kv * S_total + j;
+                  float k_scale = cache->k_scales[scale_idx];
+                  for (size_t d = 0; d < D; ++d) {
+                    dot += q_data[q_base + d] *
+                           (static_cast<float>(cache->quantized_k[k_base + d]) *
+                            k_scale);
+                  }
+                } else {
+                  size_t k_base =
+                      b * (H_kv * S_total * D) + h_kv * (S_total * D) + j * D;
+                  for (size_t d = 0; d < D; ++d) {
+                    dot += q_data[q_base + d] * k_data[k_base + d];
+                  }
+                }
+                float score = dot / scale;
+                row_scores[j] = score;
+                if (score > max_score) {
+                  max_score = score;
+                }
+              }
+
+              float sum_exp = 0.0f;
+              for (size_t j = 0; j < S_total; ++j) {
+                if (causal_ && j > S_past + i) {
+                  row_scores[j] = 0.0f;
+                  continue;
+                }
+                float val = std::exp(row_scores[j] - max_score);
+                row_scores[j] = val;
+                sum_exp += val;
+              }
+
+              if (sum_exp > 0.0f) {
+                float inv_sum = 1.0f / sum_exp;
+                for (size_t j = 0; j < S_total; ++j) {
+                  row_scores[j] *= inv_sum;
+                }
+              }
+
+              size_t out_base = b * (S * H * D) + i * (H * D) + h * D;
+              for (size_t d = 0; d < D; ++d) {
+                float sum_val = 0.0f;
+                for (size_t j = 0; j < S_total; ++j) {
+                  if (row_scores[j] == 0.0f)
+                    continue;
+                  if (cache && cache->quantized) {
+                    size_t v_idx = b * (H_kv * S_total * D) +
+                                   h_kv * (S_total * D) + j * D + d;
+                    size_t scale_idx =
+                        b * (H_kv * S_total) + h_kv * S_total + j;
+                    float v_scale = cache->v_scales[scale_idx];
+                    sum_val += row_scores[j] *
+                               (static_cast<float>(cache->quantized_v[v_idx]) *
+                                v_scale);
+                  } else {
+                    size_t v_idx = b * (H_kv * S_total * D) +
+                                   h_kv * (S_total * D) + j * D + d;
+                    sum_val += row_scores[j] * v_data[v_idx];
+                  }
+                }
+                out_data[out_base + d] = sum_val;
+              }
+            }
+          }
+        });
+
+    auto context_t = std::make_shared<Tensor>(Shape{B, S, H, D}, out_data,
+                                              input->backend(), input->dtype());
+    context_flat = context_t->reshape(Shape{B * S, E});
+  } else {
+    auto expanded_k = expand_heads(active_k, num_heads_, num_kv_heads_);
+    auto expanded_v = expand_heads(active_v, num_heads_, num_kv_heads_);
+
+    auto k_trans = expanded_k->transpose(2, 3);
+    auto scores = q_t->bmm(k_trans);
+
+    float scale = std::sqrt(static_cast<float>(head_dim_));
+    auto scaled_scores = scores / scale;
+
+    if (causal_) {
+      size_t S_total = expanded_k->shape()[2];
+      size_t S_past = S_total - S;
+      auto host_data = scaled_scores->to_host();
+      size_t H = num_heads_;
+      for (size_t b = 0; b < B; ++b) {
+        for (size_t h = 0; h < H; ++h) {
+          for (size_t i = 0; i < S; ++i) {
+            for (size_t j = S_past + i + 1; j < S_total; ++j) {
+              size_t idx =
+                  b * (H * S * S_total) + h * (S * S_total) + i * S_total + j;
+              float mask_val = (scaled_scores->dtype() == DataType::FP16)
+                                   ? -65000.0f
+                                   : -1e9f;
+              host_data[idx] = mask_val;
+            }
           }
         }
       }
+      scaled_scores->copy_from_host(host_data);
     }
-    scaled_scores->copy_from_host(host_data);
+
+    auto attn = scaled_scores->softmax(3);
+
+    auto context = attn->bmm(expanded_v);
+    auto context_t = context->transpose(1, 2);
+    context_flat = context_t->reshape(Shape{B * S, E});
   }
-
-  auto attn = scaled_scores->softmax(3);
-
-  auto context = attn->bmm(active_v);
-  auto context_t = context->transpose(1, 2);
-  auto context_flat = context_t->reshape(Shape{B * S, E});
 
   auto out_flat = out_proj_->forward(context_flat);
   return out_flat->reshape(Shape{B, S, E});
@@ -911,6 +1376,287 @@ std::vector<size_t> TransformerDecoder::generate_advanced(
   }
 
   set_training(was_training);
+  return generated;
+}
+
+std::vector<size_t> TransformerDecoder::generate_speculative(
+    TransformerDecoder *draft_model, const std::vector<size_t> &prompt,
+    size_t max_new_tokens, size_t lookahead, float temperature, size_t top_k,
+    float top_p, unsigned int seed, bool quantized_cache) {
+  std::vector<size_t> generated = prompt;
+  auto backend = token_emb_->parameters()[0]->backend();
+
+  bool was_training = training_;
+  bool draft_was_training = draft_model->training_;
+  set_training(false);
+  draft_model->set_training(false);
+
+  std::mt19937 gen(seed);
+
+  std::vector<KVCache> target_caches(layers_.size(), KVCache(quantized_cache));
+  std::vector<KVCache> draft_caches(draft_model->layers_.size(),
+                                    KVCache(quantized_cache));
+
+  size_t S = generated.size();
+  std::vector<float> input_data(S);
+  for (size_t i = 0; i < S; ++i) {
+    input_data[i] = static_cast<float>(generated[i]);
+  }
+  auto input_tensor =
+      std::make_shared<Tensor>(Shape{1, S}, input_data, backend);
+  auto target_logits = forward(input_tensor, &target_caches);
+  auto draft_logits = draft_model->forward(input_tensor, &draft_caches);
+
+  auto get_probs = [&](const std::vector<float> &logits) -> std::vector<float> {
+    size_t vocab = logits.size();
+    std::vector<float> probs(vocab);
+    if (temperature <= 0.0f) {
+      float max_val = logits[0];
+      size_t argmax = 0;
+      for (size_t v = 1; v < vocab; ++v) {
+        if (logits[v] > max_val) {
+          max_val = logits[v];
+          argmax = v;
+        }
+      }
+      probs[argmax] = 1.0f;
+      return probs;
+    }
+
+    std::vector<float> scaled_logits = logits;
+    for (size_t v = 0; v < vocab; ++v) {
+      scaled_logits[v] /= temperature;
+    }
+
+    float max_logit = scaled_logits[0];
+    for (size_t v = 1; v < vocab; ++v) {
+      if (scaled_logits[v] > max_logit) {
+        max_logit = scaled_logits[v];
+      }
+    }
+
+    float sum_probs = 0.0f;
+    for (size_t v = 0; v < vocab; ++v) {
+      probs[v] = std::exp(scaled_logits[v] - max_logit);
+      sum_probs += probs[v];
+    }
+    for (size_t v = 0; v < vocab; ++v) {
+      probs[v] /= sum_probs;
+    }
+
+    std::vector<std::pair<float, size_t>> indexed_probs(vocab);
+    for (size_t v = 0; v < vocab; ++v) {
+      indexed_probs[v] = {probs[v], v};
+    }
+
+    std::sort(indexed_probs.begin(), indexed_probs.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+
+    if (top_k > 0 && top_k < vocab) {
+      for (size_t i = top_k; i < vocab; ++i) {
+        indexed_probs[i].first = 0.0f;
+      }
+    }
+
+    if (top_p > 0.0f && top_p < 1.0f) {
+      float cum_sum = 0.0f;
+      bool cut = false;
+      for (size_t i = 0; i < vocab; ++i) {
+        if (cut) {
+          indexed_probs[i].first = 0.0f;
+        } else {
+          cum_sum += indexed_probs[i].first;
+          if (cum_sum >= top_p) {
+            cut = true;
+          }
+        }
+      }
+    }
+
+    float final_sum = 0.0f;
+    for (size_t v = 0; v < vocab; ++v) {
+      final_sum += indexed_probs[v].first;
+    }
+
+    std::vector<float> final_probs(vocab, 0.0f);
+    if (final_sum <= 0.0f) {
+      final_probs[indexed_probs[0].second] = 1.0f;
+    } else {
+      for (size_t v = 0; v < vocab; ++v) {
+        size_t orig_idx = indexed_probs[v].second;
+        final_probs[orig_idx] = indexed_probs[v].first / final_sum;
+      }
+    }
+    return final_probs;
+  };
+
+  auto sample_token = [&](const std::vector<float> &probs) -> size_t {
+    std::vector<double> normalized_probs(probs.begin(), probs.end());
+    std::discrete_distribution<size_t> dist(normalized_probs.begin(),
+                                            normalized_probs.end());
+    return dist(gen);
+  };
+
+  std::vector<float> host_t_logits = target_logits->to_host();
+  size_t vocab_size = target_logits->shape()[2];
+  size_t S_out = target_logits->shape()[1];
+  size_t last_token_offset = (S_out - 1) * vocab_size;
+  std::vector<float> first_token_logits(vocab_size);
+  for (size_t v = 0; v < vocab_size; ++v) {
+    first_token_logits[v] = host_t_logits[last_token_offset + v];
+  }
+  auto first_probs = get_probs(first_token_logits);
+  size_t first_token = sample_token(first_probs);
+  generated.push_back(first_token);
+
+  size_t num_generated = 1;
+
+  while (num_generated < max_new_tokens) {
+    size_t M = std::min(lookahead, max_new_tokens - num_generated);
+    if (M == 0) {
+      break;
+    }
+
+    size_t target_S_start = 0;
+    if (target_caches[0].quantized) {
+      if (!target_caches[0].quantized_k.empty()) {
+        target_S_start = target_caches[0].shape[2];
+      }
+    } else if (target_caches[0].k) {
+      target_S_start = target_caches[0].k->shape()[2];
+    }
+
+    size_t draft_S_start = 0;
+    if (draft_caches[0].quantized) {
+      if (!draft_caches[0].quantized_k.empty()) {
+        draft_S_start = draft_caches[0].shape[2];
+      }
+    } else if (draft_caches[0].k) {
+      draft_S_start = draft_caches[0].k->shape()[2];
+    }
+
+    std::vector<size_t> draft_candidates;
+    std::vector<std::vector<float>> draft_probs;
+
+    for (size_t j = 0; j < M; ++j) {
+      size_t next_input = (j == 0) ? generated.back() : draft_candidates.back();
+      std::vector<float> d_input_data = {static_cast<float>(next_input)};
+      auto d_input =
+          std::make_shared<Tensor>(Shape{1, 1}, d_input_data, backend);
+      auto d_logits = draft_model->forward(d_input, &draft_caches);
+
+      std::vector<float> host_d_logits = d_logits->to_host();
+      size_t d_vocab_size = d_logits->shape()[2];
+      std::vector<float> d_token_logits(d_vocab_size);
+      for (size_t v = 0; v < d_vocab_size; ++v) {
+        d_token_logits[v] = host_d_logits[v];
+      }
+      auto q_j = get_probs(d_token_logits);
+      size_t candidate = sample_token(q_j);
+      draft_candidates.push_back(candidate);
+      draft_probs.push_back(q_j);
+    }
+
+    std::vector<float> t_input_data(M + 1);
+    t_input_data[0] = static_cast<float>(generated.back());
+    for (size_t i = 0; i < M; ++i) {
+      t_input_data[i + 1] = static_cast<float>(draft_candidates[i]);
+    }
+    auto t_input =
+        std::make_shared<Tensor>(Shape{1, M + 1}, t_input_data, backend);
+    auto t_logits = forward(t_input, &target_caches);
+
+    std::vector<float> host_t_logits_step = t_logits->to_host();
+    size_t t_vocab_size = t_logits->shape()[2];
+    std::vector<std::vector<float>> target_probs(M + 1);
+    for (size_t i = 0; i <= M; ++i) {
+      size_t offset = i * t_vocab_size;
+      std::vector<float> step_logits(t_vocab_size);
+      for (size_t v = 0; v < t_vocab_size; ++v) {
+        step_logits[v] = host_t_logits_step[offset + v];
+      }
+      target_probs[i] = get_probs(step_logits);
+    }
+
+    bool all_accepted = true;
+    size_t rejected_idx = 0;
+
+    for (size_t j = 0; j < M; ++j) {
+      size_t tilde_x = draft_candidates[j];
+      float q = draft_probs[j][tilde_x];
+      float p = target_probs[j][tilde_x];
+
+      bool accepted = false;
+      if (temperature <= 0.0f) {
+        size_t target_greedy = std::distance(
+            target_probs[j].begin(),
+            std::max_element(target_probs[j].begin(), target_probs[j].end()));
+        accepted = (tilde_x == target_greedy);
+      } else {
+        std::uniform_real_distribution<float> uniform_dist(0.0f, 1.0f);
+        float r = uniform_dist(gen);
+        accepted = (r * q < p);
+      }
+
+      if (accepted) {
+        generated.push_back(tilde_x);
+        num_generated++;
+      } else {
+        all_accepted = false;
+        rejected_idx = j;
+        break;
+      }
+    }
+
+    if (!all_accepted) {
+      std::vector<float> probs_rec(t_vocab_size, 0.0f);
+      float sum_rec = 0.0f;
+      for (size_t v = 0; v < t_vocab_size; ++v) {
+        probs_rec[v] = std::max(0.0f, target_probs[rejected_idx][v] -
+                                          draft_probs[rejected_idx][v]);
+        sum_rec += probs_rec[v];
+      }
+      size_t recovered_token = 0;
+      if (sum_rec <= 0.0f) {
+        recovered_token = sample_token(target_probs[rejected_idx]);
+      } else {
+        for (size_t v = 0; v < t_vocab_size; ++v) {
+          probs_rec[v] /= sum_rec;
+        }
+        recovered_token = sample_token(probs_rec);
+      }
+
+      generated.push_back(recovered_token);
+      num_generated++;
+
+      for (auto &cache : target_caches) {
+        cache.truncate(target_S_start + rejected_idx + 1);
+      }
+      for (auto &cache : draft_caches) {
+        cache.truncate(draft_S_start + rejected_idx + 1);
+      }
+
+      std::vector<float> catchup_data = {static_cast<float>(recovered_token)};
+      auto catchup_input =
+          std::make_shared<Tensor>(Shape{1, 1}, catchup_data, backend);
+      draft_model->forward(catchup_input, &draft_caches);
+    } else {
+      if (num_generated < max_new_tokens) {
+        size_t final_token = sample_token(target_probs[M]);
+        generated.push_back(final_token);
+        num_generated++;
+
+        std::vector<float> catchup_data = {
+            static_cast<float>(draft_candidates[M - 1])};
+        auto catchup_input =
+            std::make_shared<Tensor>(Shape{1, 1}, catchup_data, backend);
+        draft_model->forward(catchup_input, &draft_caches);
+      }
+    }
+  }
+
+  set_training(was_training);
+  draft_model->set_training(draft_was_training);
   return generated;
 }
 

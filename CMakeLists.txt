@@ -31,6 +31,7 @@ set(NEURAL_NETWORK_SOURCES
     src/backend/thread_pool.cpp
     src/optim/grad_scaler.cpp
     src/nn/lora.cpp
+    src/nn/quantization.cpp
 )
 
 if(WITH_DML)
@@ -100,3 +101,11 @@ add_test(NAME AMPTest COMMAND amp_test)
 add_executable(lora_test tests/nn/lora_test.cpp)
 target_link_libraries(lora_test PRIVATE neural_network GTest::gtest GTest::gtest_main)
 add_test(NAME LoRATest COMMAND lora_test)
+
+add_executable(quantization_test tests/nn/quantization_test.cpp)
+target_link_libraries(quantization_test PRIVATE neural_network GTest::gtest GTest::gtest_main)
+add_test(NAME QuantizationTest COMMAND quantization_test)
+
+add_executable(gqa_test tests/nn/gqa_test.cpp)
+target_link_libraries(gqa_test PRIVATE neural_network GTest::gtest GTest::gtest_main)
+add_test(NAME GQATest COMMAND gqa_test)
